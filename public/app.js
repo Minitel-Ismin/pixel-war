@@ -1,7 +1,6 @@
 'use strict';
 
 (() => {
-  // ─────────────────────────── DOM Elements ───────────────────────────
   const viewport = document.getElementById('viewport');
   const ctx = viewport.getContext('2d', { alpha: false });
 
@@ -11,6 +10,7 @@
     onlineBadge: document.getElementById('onlineBadge'),
     canvasSizeBadge: document.getElementById('canvasSizeBadge'),
     pausedBadge: document.getElementById('pausedBadge'),
+    startBadge: document.getElementById('startBadge'),
     countdownBadge: document.getElementById('countdownBadge'),
     announcementBar: document.getElementById('announcementBar'),
     announcementText: document.getElementById('announcementText'),
@@ -28,9 +28,14 @@
     adminQuickBar: document.getElementById('adminQuickBar'),
     btnAdminBypass: document.getElementById('btnAdminBypass'),
     btnBrushSize: document.getElementById('btnBrushSize'),
+    btnBrushShape: document.getElementById('btnBrushShape'),
+    btnDragPaint: document.getElementById('btnDragPaint'),
+    btnLootbox: document.getElementById('btnLootbox'),
+    lootBadge: document.getElementById('lootBadge'),
+    activeBoostBar: document.getElementById('activeBoostBar'),
+    activeBoostText: document.getElementById('activeBoostText'),
   };
 
-  // ─────────────────────────── Application State ───────────────────────────
   const state = {
     config: {
       title: 'Pixel War',
@@ -38,63 +43,65 @@
       height: 128,
       cooldownMs: 5000,
       maxCharges: 1,
-      cooldownMode: 'client',
+      cooldownMode: 'authentik',
       paused: false,
       manualPaused: false,
+      beforeStart: false,
+      replayRecording: true,
       allowSameColor: false,
       allowPublicExport: true,
       allowTimelapse: true,
       requireNickname: false,
+      lockNicknameToAuthentik: false,
       announcement: '',
+      startTime: null,
+      lockBeforeStart: false,
       endTime: null,
       autoSnapshotMinutes: 15,
+      maxAutoSnapshots: 48,
+      nextAutoSnapshotAt: null,
+      lootboxEnabled: true,
+      lootboxIntervalMinutes: 60,
       palette: ['#FFFFFF', '#000000'],
       totalPixelsPlaced: 0,
     },
     presets: {},
-    paletteRgba: [], // [ [r,g,b,255], ... ]
+    lootboxItems: {},
+    nextLootboxDropAt: null,
+    inventory: { lootboxes: 0, items: {}, activeBoost: null, bonusCharges: 0 },
+    shields: [],
+    paletteRgba: [],
     pixels: new Uint8Array(128 * 128),
     selectedColor: 1,
-    selectedPixel: null, // { x, y }
+    selectedPixel: null,
     hoverPixel: null,
     online: 0,
     isAdmin: false,
+    passwordLoginEnabled: false,
+    authentikUser: null,
     adminToken: sessionStorage.getItem('pw_admin_token') || '',
     adminBypass: false,
     adminBrushSize: 1,
+    adminBrushShape: 'square',
+    dragPaintMode: false,
     nickname: localStorage.getItem('pw_nickname') || '',
     showGrid: true,
     eyedropperMode: false,
     directPlaceMode: false,
     soundEnabled: false,
-    // Cooldown synced from server
     cooldown: {
       charges: 1,
       maxCharges: 1,
-      nextRefillAt: 0, // performance.now() timestamp when next charge refills
+      bonusCharges: 0,
+      nextRefillAt: 0,
       cooldownMs: 5000,
+      activeBoost: null,
     },
     serverTimeOffset: 0,
-    // Camera (world pixel coordinates)
-    cam: {
-      x: 64,
-      y: 64,
-      zoom: 6, // screen CSS pixels per canvas pixel
-      minZoom: 0.5,
-      maxZoom: 48,
-    },
-    // Visual placement pulses
-    pulses: [], // { x, y, colorHex, start }
-    // Client-side guide overlay
-    overlay: {
-      img: null,
-      visible: true,
-      x: 0,
-      y: 0,
-      w: 32,
-      opacity: 0.5,
-    },
-    // Offscreen canvas buffer (1:1 pixel resolution)
+    cam: { x: 64, y: 64, zoom: 6, minZoom: 0.5, maxZoom: 48 },
+    pulses: [],
+    bombFx: [],
+    overlay: { img: null, visible: true, x: 0, y: 0, w: 32, opacity: 0.5 },
     offscreen: document.createElement('canvas'),
     offCtx: null,
     offImageData: null,
@@ -124,15 +131,13 @@
       t.style.opacity = '0';
       t.style.transition = 'opacity 0.25s';
       setTimeout(() => t.remove(), 260);
-    }, 3000);
+    }, 3200);
   }
 
   function playPopSound(freq = 520) {
     if (!state.soundEnabled) return;
     try {
-      if (!state.audioCtx) {
-        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      }
+      if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       const osc = state.audioCtx.createOscillator();
       const gain = state.audioCtx.createGain();
       osc.type = 'sine';
@@ -145,7 +150,7 @@
       osc.start();
       osc.stop(state.audioCtx.currentTime + 0.09);
     } catch {
-      // ignore audio restrictions
+      // ignore
     }
   }
 
@@ -169,10 +174,35 @@
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
   }
 
+  function toLocalInputValue(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+
   function adminHeaders() {
     const h = { 'Content-Type': 'application/json' };
     if (state.adminToken) h['X-Admin-Token'] = state.adminToken;
     return h;
+  }
+
+  function getActiveBoost() {
+    const b = state.inventory?.activeBoost;
+    if (!b) return null;
+    const serverNow = Date.now() + state.serverTimeOffset;
+    if (b.expiresAt && serverNow >= b.expiresAt) return null;
+    if (typeof b.remainingUses === 'number' && b.remainingUses <= 0) return null;
+    return b;
+  }
+
+  function canDragPaintNow() {
+    if (state.isAdmin && state.adminBypass) return true;
+    const boost = getActiveBoost();
+    if (boost && (boost.type === 'frenzy' || boost.type === 'rainbow')) return true;
+    if (state.config.cooldownMs === 0) return true;
+    if ((state.cooldown.charges + (state.cooldown.bonusCharges || 0)) > 1) return true;
+    return false;
   }
 
   // ─────────────────────────── Canvas Buffer & Rendering ───────────────────────────
@@ -191,7 +221,6 @@
     state.offImageData = state.offCtx.createImageData(w, h);
     const data = state.offImageData.data;
     const fallback = state.paletteRgba[0] || [255, 255, 255, 255];
-
     for (let i = 0; i < state.pixels.length; i++) {
       const rgba = state.paletteRgba[state.pixels[i]] || fallback;
       const p = i * 4;
@@ -218,13 +247,8 @@
     state.offImageData.data[p + 2] = rgba[2];
     state.offImageData.data[p + 3] = 255;
     state.offCtx.putImageData(state.offImageData, 0, 0, x, y, 1, 1);
-    state.pulses.push({
-      x,
-      y,
-      colorHex: state.config.palette[colorIdx] || '#fff',
-      start: performance.now(),
-    });
-    if (state.pulses.length > 60) state.pulses.shift();
+    state.pulses.push({ x, y, start: performance.now() });
+    if (state.pulses.length > 80) state.pulses.shift();
     state.needsRender = true;
   }
 
@@ -243,8 +267,7 @@
     state.cam.y = h / 2;
     const availW = window.innerWidth * 0.84;
     const availH = (window.innerHeight - 210) * 0.84;
-    const fitZoom = Math.min(availW / w, availH / h);
-    state.cam.zoom = Math.max(0.8, Math.min(20, fitZoom));
+    state.cam.zoom = Math.max(0.8, Math.min(20, Math.min(availW / w, availH / h)));
     state.needsRender = true;
   }
 
@@ -286,9 +309,9 @@
   function renderFrame(now) {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const hasPulses = state.pulses.length > 0;
+    const hasAnim = state.pulses.length > 0 || state.bombFx.length > 0 || state.shields.length > 0;
 
-    if (state.needsRender || hasPulses) {
+    if (state.needsRender || hasAnim) {
       state.needsRender = false;
       ctx.fillStyle = '#090d16';
       ctx.fillRect(0, 0, vw, vh);
@@ -297,15 +320,12 @@
       const drawW = state.config.width * state.cam.zoom;
       const drawH = state.config.height * state.cam.zoom;
 
-      // Subtle canvas drop shadow & frame
       ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
       ctx.fillRect(tl.sx - 3, tl.sy - 3, drawW + 6, drawH + 6);
 
-      // Draw pixel-perfect canvas
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(state.offscreen, tl.sx, tl.sy, drawW, drawH);
 
-      // Optional user template overlay
       if (state.overlay.img && state.overlay.visible) {
         const aspect = state.overlay.img.height / Math.max(1, state.overlay.img.width);
         const ow = state.overlay.w * state.cam.zoom;
@@ -318,7 +338,6 @@
         ctx.restore();
       }
 
-      // Pixel grid (when zoomed in enough)
       if (state.showGrid && state.cam.zoom >= 6) {
         const startX = Math.max(0, Math.floor(screenToWorld(0, 0).wx));
         const endX = Math.min(state.config.width, Math.ceil(screenToWorld(vw, 0).wx));
@@ -341,66 +360,116 @@
         ctx.stroke();
       }
 
-      // Outer border
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.25)';
       ctx.lineWidth = 1.5;
       ctx.strokeRect(tl.sx, tl.sy, drawW, drawH);
 
-      // Placement ripple animations
-      if (hasPulses) {
-        for (let i = state.pulses.length - 1; i >= 0; i--) {
-          const p = state.pulses[i];
-          const t = (now - p.start) / 420;
-          if (t >= 1) {
-            state.pulses.splice(i, 1);
-            continue;
-          }
-          const pos = worldToScreen(p.x, p.y);
-          const expand = t * Math.max(6, state.cam.zoom * 0.7);
-          ctx.strokeStyle = `rgba(255, 255, 255, ${(1 - t) * 0.85})`;
-          ctx.lineWidth = 2;
-          ctx.strokeRect(
-            pos.sx - expand / 2,
-            pos.sy - expand / 2,
-            state.cam.zoom + expand,
-            state.cam.zoom + expand
-          );
-        }
+      // Active Shield Zones (5x5 golden aura)
+      const serverNow = Date.now() + state.serverTimeOffset;
+      for (const sh of state.shields) {
+        if (sh.expiresAt <= serverNow) continue;
+        const pos = worldToScreen(sh.x - sh.radius, sh.y - sh.radius);
+        const sz = (sh.radius * 2 + 1) * state.cam.zoom;
+        ctx.save();
+        ctx.fillStyle = 'rgba(251, 191, 36, 0.14)';
+        ctx.fillRect(pos.sx, pos.sy, sz, sz);
+        ctx.strokeStyle = 'rgba(251, 191, 36, 0.9)';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(pos.sx, pos.sy, sz, sz);
+        ctx.restore();
       }
 
-      // Hover highlight (desktop)
+      // Paint Bomb shockwave FX
+      for (let i = state.bombFx.length - 1; i >= 0; i--) {
+        const fx = state.bombFx[i];
+        const t = (now - fx.start) / 650;
+        if (t >= 1) {
+          state.bombFx.splice(i, 1);
+          continue;
+        }
+        const cPos = worldToScreen(fx.x + 0.5, fx.y + 0.5);
+        const r = (1 + t * 5.2) * state.cam.zoom;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cPos.sx, cPos.sy, r, 0, Math.PI * 2);
+        ctx.strokeStyle = fx.colorHex || '#fbbf24';
+        ctx.globalAlpha = (1 - t) * 0.9;
+        ctx.lineWidth = Math.max(2, 5 * (1 - t));
+        ctx.stroke();
+        ctx.restore();
+      }
+
+      // Pixel placement ripples
+      for (let i = state.pulses.length - 1; i >= 0; i--) {
+        const p = state.pulses[i];
+        const t = (now - p.start) / 380;
+        if (t >= 1) {
+          state.pulses.splice(i, 1);
+          continue;
+        }
+        const pos = worldToScreen(p.x, p.y);
+        const expand = t * Math.max(5, state.cam.zoom * 0.6);
+        ctx.strokeStyle = `rgba(255, 255, 255, ${(1 - t) * 0.75})`;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(pos.sx - expand / 2, pos.sy - expand / 2, state.cam.zoom + expand, state.cam.zoom + expand);
+      }
+
+      // Hover highlight
       if (state.hoverPixel) {
         const { x, y } = state.hoverPixel;
         if (x >= 0 && x < state.config.width && y >= 0 && y < state.config.height) {
           const pos = worldToScreen(x, y);
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.55)';
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
           ctx.lineWidth = 1.5;
           ctx.strokeRect(pos.sx + 0.5, pos.sy + 0.5, state.cam.zoom - 1, state.cam.zoom - 1);
         }
       }
 
-      // Selected pixel reticle + color preview
+      // Selected pixel / Boost / Wide Brush preview reticle
       if (state.selectedPixel) {
         const { x, y } = state.selectedPixel;
-        const brush = state.isAdmin && state.adminBypass ? state.adminBrushSize : 1;
+        const boost = !state.adminBypass ? getActiveBoost() : null;
+        let brush = state.isAdmin && state.adminBypass ? state.adminBrushSize : 1;
+        let shape = state.isAdmin && state.adminBypass ? state.adminBrushShape : 'square';
+
+        if (boost?.type === 'brush3') { brush = 3; shape = 'square'; }
+        else if (boost?.type === 'shield') { brush = 5; shape = 'square'; }
+        else if (boost?.type === 'bomb') { brush = 9; shape = 'circle'; }
+
         const half = Math.floor(brush / 2);
         const pos = worldToScreen(x - half, y - half);
         const size = state.cam.zoom * brush;
 
-        // Subtle inner preview of selected color
         ctx.save();
-        ctx.globalAlpha = 0.55;
-        ctx.fillStyle = state.config.palette[state.selectedColor] || '#fff';
-        ctx.fillRect(pos.sx + 1, pos.sy + 1, Math.max(1, size - 2), Math.max(1, size - 2));
+        if (shape === 'circle' && brush > 1) {
+          const cPos = worldToScreen(x + 0.5, y + 0.5);
+          const rad = (brush / 2) * state.cam.zoom;
+          ctx.beginPath();
+          ctx.arc(cPos.sx, cPos.sy, rad, 0, Math.PI * 2);
+          ctx.fillStyle = state.config.palette[state.selectedColor] || '#fff';
+          ctx.globalAlpha = 0.35;
+          ctx.fill();
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 3;
+          ctx.stroke();
+          ctx.strokeStyle = boost?.type === 'bomb' ? '#fbbf24' : '#fff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        } else {
+          ctx.globalAlpha = boost?.type === 'shield' ? 0.25 : 0.5;
+          ctx.fillStyle = boost?.type === 'shield' ? '#fbbf24' : (state.config.palette[state.selectedColor] || '#fff');
+          ctx.fillRect(pos.sx + 1, pos.sy + 1, Math.max(1, size - 2), Math.max(1, size - 2));
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = '#000000';
+          ctx.lineWidth = 3;
+          ctx.strokeRect(pos.sx - 1, pos.sy - 1, size + 2, size + 2);
+          ctx.strokeStyle = boost?.type === 'shield' ? '#fbbf24' : '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.strokeRect(pos.sx - 1, pos.sy - 1, size + 2, size + 2);
+        }
         ctx.restore();
-
-        // Crisp double border reticle
-        ctx.strokeStyle = '#000000';
-        ctx.lineWidth = 3;
-        ctx.strokeRect(pos.sx - 1, pos.sy - 1, size + 2, size + 2);
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(pos.sx - 1, pos.sy - 1, size + 2, size + 2);
       }
     }
 
@@ -408,36 +477,51 @@
     requestAnimationFrame(renderFrame);
   }
 
-  // ─────────────────────────── Cooldown & HUD Updates ───────────────────────────
+  // ─────────────────────────── Cooldown, Boost & HUD Updates ───────────────────────────
   function syncCooldownFromServer(cd) {
     if (!cd) return;
     state.cooldown.charges = cd.charges ?? 1;
     state.cooldown.maxCharges = cd.maxCharges ?? state.config.maxCharges;
+    state.cooldown.bonusCharges = cd.bonusCharges ?? state.inventory?.bonusCharges ?? 0;
     state.cooldown.cooldownMs = cd.cooldownMs ?? state.config.cooldownMs;
-    if (cd.nextRefillMs > 0) {
-      state.cooldown.nextRefillAt = performance.now() + cd.nextRefillMs;
-    } else {
-      state.cooldown.nextRefillAt = 0;
-    }
+    state.cooldown.activeBoost = cd.activeBoost || null;
+    state.cooldown.nextRefillAt = cd.nextRefillMs > 0 ? performance.now() + cd.nextRefillMs : 0;
+  }
+
+  function syncInventory(inv) {
+    if (!inv) return;
+    state.inventory = inv;
+    state.cooldown.bonusCharges = inv.bonusCharges || 0;
+    const totalOwned = (inv.lootboxes || 0) + Object.values(inv.items || {}).reduce((s, n) => s + (n || 0), 0);
+    el.lootBadge.textContent = String(totalOwned);
+    el.lootBadge.classList.toggle('hidden', totalOwned === 0);
+    el.btnLootbox.classList.toggle('has-loot', (inv.lootboxes || 0) > 0);
+    renderLootboxModal();
+    state.needsRender = true;
   }
 
   function updateCooldownUI(now) {
-    // Advance local refill timer smoothly
     const cd = state.cooldown;
     if (cd.charges < cd.maxCharges && cd.cooldownMs > 0 && cd.nextRefillAt > 0) {
       while (now >= cd.nextRefillAt && cd.charges < cd.maxCharges) {
         cd.charges++;
-        if (cd.charges < cd.maxCharges) {
-          cd.nextRefillAt += cd.cooldownMs;
-        } else {
-          cd.nextRefillAt = 0;
-        }
+        cd.nextRefillAt = cd.charges < cd.maxCharges ? cd.nextRefillAt + cd.cooldownMs : 0;
       }
     }
 
-    // Countdown badge if endTime is set
+    const serverNow = Date.now() + state.serverTimeOffset;
+
+    // Start countdown badge (before official startTime)
+    if (state.config.startTime && serverNow < Date.parse(state.config.startTime)) {
+      const remStart = Date.parse(state.config.startTime) - serverNow;
+      el.startBadge.classList.remove('hidden');
+      el.startBadge.textContent = `⏳ Début ${formatCountdown(remStart)}`;
+    } else {
+      el.startBadge.classList.add('hidden');
+    }
+
+    // End countdown badge
     if (state.config.endTime) {
-      const serverNow = Date.now() + state.serverTimeOffset;
       const remain = Date.parse(state.config.endTime) - serverNow;
       el.countdownBadge.classList.remove('hidden');
       el.countdownBadge.textContent = remain > 0 ? `⏱ ${formatCountdown(remain)}` : '🏁 Terminé';
@@ -445,29 +529,50 @@
       el.countdownBadge.classList.add('hidden');
     }
 
-    // Selected color swatch
+    // Active boost live banner
+    const boost = getActiveBoost();
+    if (boost) {
+      const def = state.lootboxItems[boost.type] || { icon: '✨', name: boost.type };
+      let detail = '';
+      if (boost.expiresAt) {
+        const remS = Math.max(0, (boost.expiresAt - serverNow) / 1000).toFixed(1);
+        detail = ` — ${remS}s restantes !`;
+      } else if (typeof boost.remainingUses === 'number') {
+        detail = ` — ${boost.remainingUses} utilisation${boost.remainingUses > 1 ? 's' : ''}`;
+      }
+      el.activeBoostText.textContent = `${def.icon} ${def.name.toUpperCase()}${detail}`;
+      el.activeBoostBar.classList.remove('hidden');
+    } else {
+      el.activeBoostBar.classList.add('hidden');
+    }
+
     const hex = state.config.palette[state.selectedColor] || '#FFFFFF';
     el.selectedSwatch.style.backgroundColor = hex;
 
-    // Charges badge (shown when stacking > 1)
-    if (cd.maxCharges > 1 && !(state.isAdmin && state.adminBypass)) {
+    const totalCharges = cd.charges + (cd.bonusCharges || 0);
+    if ((cd.maxCharges > 1 || (cd.bonusCharges || 0) > 0) && !(state.isAdmin && state.adminBypass)) {
       el.chargesBadge.classList.remove('hidden');
-      el.chargesBadge.textContent = `⚡ ${cd.charges}/${cd.maxCharges}`;
+      el.chargesBadge.textContent = cd.bonusCharges > 0
+        ? `⚡ ${cd.charges}/${cd.maxCharges} (+${cd.bonusCharges}🎁)`
+        : `⚡ ${cd.charges}/${cd.maxCharges}`;
     } else {
       el.chargesBadge.classList.add('hidden');
     }
 
-    // Place button state
     const isAdminFree = state.isAdmin && state.adminBypass;
+    const isBoostInstant = boost && ['frenzy', 'bomb', 'brush3', 'shield'].includes(boost.type);
+
     if (state.config.paused && !isAdminFree) {
       el.btnPlace.disabled = true;
       el.btnPlace.classList.remove('cooldown');
       el.placeProgress.style.width = '0%';
-      el.placeBtnText.textContent = '⏸ Canvas figé';
+      el.placeBtnText.textContent = state.config.beforeStart && state.config.lockBeforeStart
+        ? '⏳ En attente du top départ'
+        : '⏸ Canvas figé';
       return;
     }
 
-    if (!isAdminFree && cd.charges <= 0 && cd.cooldownMs > 0) {
+    if (!isAdminFree && !isBoostInstant && totalCharges <= 0 && cd.cooldownMs > 0) {
       const rem = Math.max(0, cd.nextRefillAt - now);
       const pct = Math.max(0, Math.min(100, ((cd.cooldownMs - rem) / cd.cooldownMs) * 100));
       el.btnPlace.disabled = true;
@@ -482,14 +587,22 @@
 
     if (!state.selectedPixel) {
       el.btnPlace.disabled = true;
-      el.placeBtnText.textContent = 'Touchez un pixel sur le canvas';
+      el.placeBtnText.textContent = state.dragPaintMode ? '🖌️ Glissez pour peindre !' : 'Touchez un pixel sur le canvas';
       return;
     }
 
     el.btnPlace.disabled = false;
     const { x, y } = state.selectedPixel;
     if (isAdminFree) {
-      el.placeBtnText.textContent = `👑 Poser Admin (${x}, ${y})`;
+      el.placeBtnText.textContent = `👑 Poser Admin ${state.adminBrushSize}× (${x}, ${y})`;
+    } else if (boost?.type === 'bomb') {
+      el.placeBtnText.textContent = `💣 Lancer la Bombe (${x}, ${y})`;
+    } else if (boost?.type === 'brush3') {
+      el.placeBtnText.textContent = `🖌️ Peindre 3×3 (${x}, ${y})`;
+    } else if (boost?.type === 'shield') {
+      el.placeBtnText.textContent = `🛡️ Poser Bouclier 5×5 (${x}, ${y})`;
+    } else if (boost?.type === 'frenzy') {
+      el.placeBtnText.textContent = `⚡ Poser Frénésie (${x}, ${y})`;
     } else {
       el.placeBtnText.textContent = `Poser le pixel (${x}, ${y})`;
     }
@@ -508,8 +621,17 @@
       el.announcementBar.classList.add('hidden');
     }
 
-    el.nickLabel.textContent = state.nickname || 'Pseudo';
+    el.nickLabel.textContent = state.nickname || state.authentikUser?.username || 'Pseudo';
     el.adminQuickBar.classList.toggle('hidden', !state.isAdmin);
+
+    const btnAdmin = document.getElementById('btnAdmin');
+    if (btnAdmin) {
+      btnAdmin.classList.toggle('hidden', !state.isAdmin && !state.passwordLoginEnabled);
+    }
+    if (!state.isAdmin) {
+      state.adminBypass = false;
+      el.btnAdminBypass.classList.remove('active');
+    }
     renderPaletteBar();
   }
 
@@ -548,20 +670,31 @@
       if (!r.ok) return;
       const info = await r.json();
       if (state.selectedPixel && state.selectedPixel.x === x && state.selectedPixel.y === y) {
-        if (info.author) {
-          el.pixelAuthorText.textContent = `Par ${info.author} • ${formatTimeAgo(info.timestamp)}`;
-        } else if (info.timestamp) {
-          el.pixelAuthorText.textContent = `Anonyme • ${formatTimeAgo(info.timestamp)}`;
-        } else {
-          el.pixelAuthorText.textContent = 'Pixel vierge';
-        }
+        if (info.author) el.pixelAuthorText.textContent = `Par ${info.author} • ${formatTimeAgo(info.timestamp)}`;
+        else if (info.timestamp) el.pixelAuthorText.textContent = `Anonyme • ${formatTimeAgo(info.timestamp)}`;
+        else el.pixelAuthorText.textContent = 'Pixel vierge';
       }
     } catch {
-      // aborted or network error
+      // ignore
     }
   }
 
-  // ─────────────────────────── Placement Logic ───────────────────────────
+  // ─────────────────────────── Placement & Drag-Paint (Bresenham) ───────────────────────────
+  function sendPlaceAt(x, y) {
+    if (!state.wsConnected || !state.ws) return;
+    if (x < 0 || x >= state.config.width || y < 0 || y >= state.config.height) return;
+    state.ws.send(JSON.stringify({
+      type: 'place',
+      x,
+      y,
+      color: state.selectedColor,
+      nickname: state.nickname,
+      adminBypass: state.isAdmin && state.adminBypass,
+      brushSize: state.isAdmin && state.adminBypass ? state.adminBrushSize : 1,
+      brushShape: state.isAdmin && state.adminBypass ? state.adminBrushShape : 'square',
+    }));
+  }
+
   function selectPixel(x, y, autoPlaceIfDirect = true) {
     if (x < 0 || x >= state.config.width || y < 0 || y >= state.config.height) return;
 
@@ -596,17 +729,27 @@
       openModal('modalProfile');
       return;
     }
+    sendPlaceAt(state.selectedPixel.x, state.selectedPixel.y);
+  }
 
-    const { x, y } = state.selectedPixel;
-    state.ws.send(JSON.stringify({
-      type: 'place',
-      x,
-      y,
-      color: state.selectedColor,
-      nickname: state.nickname,
-      adminBypass: state.isAdmin && state.adminBypass,
-      brushSize: state.isAdmin && state.adminBypass ? state.adminBrushSize : 1,
-    }));
+  function paintLineBresenham(x0, y0, x1, y1, visitedSet) {
+    let dx = Math.abs(x1 - x0);
+    let dy = Math.abs(y1 - y0);
+    const sx = x0 < x1 ? 1 : -1;
+    const sy = y0 < y1 ? 1 : -1;
+    let err = dx - dy;
+
+    while (true) {
+      const key = `${x0},${y0}`;
+      if (!visitedSet.has(key)) {
+        visitedSet.add(key);
+        sendPlaceAt(x0, y0);
+      }
+      if (x0 === x1 && y0 === y1) break;
+      const e2 = 2 * err;
+      if (e2 > -dy) { err -= dy; x0 += sx; }
+      if (e2 < dx) { err += dx; y0 += sy; }
+    }
   }
 
   // ─────────────────────────── Network & WebSocket ───────────────────────────
@@ -627,16 +770,30 @@
   async function bootstrap() {
     try {
       const res = await fetch('/api/config', { cache: 'no-store' });
+      if (res.status === 401) {
+        const err = await res.json().catch(() => ({}));
+        showToast('Connexion Authentik requise...', 'error');
+        if (err.loginUrl) window.location.href = err.loginUrl;
+        return;
+      }
       const data = await res.json();
       state.config = data.config;
       state.presets = data.presets || {};
+      state.lootboxItems = data.lootboxItems || {};
+      state.nextLootboxDropAt = data.nextLootboxDropAt || null;
+      state.shields = data.shields || [];
       state.online = data.online || 0;
       state.isAdmin = Boolean(data.isAdmin);
-      if (data.authentikUser && !state.nickname) {
-        state.nickname = data.authentikUser.username || data.authentikUser.name || '';
+      state.passwordLoginEnabled = Boolean(data.passwordLoginEnabled);
+      state.authentikUser = data.authentikUser || null;
+      if (data.authentikUser) {
+        if (state.config.lockNicknameToAuthentik || !state.nickname) {
+          state.nickname = data.authentikUser.username || data.authentikUser.name || '';
+        }
       }
       state.serverTimeOffset = (data.serverTime || Date.now()) - Date.now();
       syncCooldownFromServer(data.cooldown);
+      syncInventory(data.inventory);
       el.onlineBadge.textContent = `● ${state.online}`;
 
       await loadCanvasBinary();
@@ -660,12 +817,8 @@
       state.reconnectDelay = 500;
       el.connDot.classList.add('online');
       el.connDot.classList.remove('offline');
-      if (state.nickname) {
-        ws.send(JSON.stringify({ type: 'set_nickname', nickname: state.nickname }));
-      }
-      if (state.adminToken) {
-        ws.send(JSON.stringify({ type: 'auth_admin', token: state.adminToken }));
-      }
+      if (state.nickname) ws.send(JSON.stringify({ type: 'set_nickname', nickname: state.nickname }));
+      if (state.adminToken) ws.send(JSON.stringify({ type: 'auth_admin', token: state.adminToken }));
     };
 
     ws.onclose = () => {
@@ -680,32 +833,29 @@
     };
 
     ws.onmessage = async (ev) => {
-      // Compact 6-byte binary pixel update: [0x01, x_hi, x_lo, y_hi, y_lo, color]
       if (ev.data instanceof ArrayBuffer) {
         const view = new DataView(ev.data);
         if (view.byteLength >= 6 && view.getUint8(0) === 0x01) {
-          const x = view.getUint16(1, false);
-          const y = view.getUint16(3, false);
-          const c = view.getUint8(5);
-          updateSinglePixelBuffer(x, y, c);
+          updateSinglePixelBuffer(view.getUint16(1, false), view.getUint16(3, false), view.getUint8(5));
         }
         return;
       }
 
       let msg;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
+      try { msg = JSON.parse(ev.data); } catch { return; }
 
       if (msg.type === 'hello') {
         state.config = msg.config;
         state.online = msg.online;
-        state.isAdmin = Boolean(msg.isAdmin || state.isAdmin);
+        state.isAdmin = Boolean(msg.isAdmin);
+        state.passwordLoginEnabled = Boolean(msg.passwordLoginEnabled);
+        if (msg.authentikUser) state.authentikUser = msg.authentikUser;
+        if (msg.shields) state.shields = msg.shields;
+        if (msg.nextLootboxDropAt !== undefined) state.nextLootboxDropAt = msg.nextLootboxDropAt;
         state.serverTimeOffset = (msg.serverTime || Date.now()) - Date.now();
         el.onlineBadge.textContent = `● ${msg.online}`;
         syncCooldownFromServer(msg.cooldown);
+        syncInventory(msg.inventory);
         rebuildPaletteRgba();
         rebuildOffscreenCanvas();
         applyConfigUI();
@@ -716,6 +866,7 @@
         const prevW = state.config.width;
         const prevH = state.config.height;
         state.config = msg.config;
+        if (msg.nextLootboxDropAt !== undefined) state.nextLootboxDropAt = msg.nextLootboxDropAt;
         if (msg.serverTime) state.serverTimeOffset = msg.serverTime - Date.now();
         rebuildPaletteRgba();
         applyConfigUI();
@@ -732,42 +883,85 @@
         showToast('Canvas mis à jour par un administrateur', 'info');
       } else if (msg.type === 'cooldown') {
         syncCooldownFromServer(msg.cooldown);
+        if (msg.inventory) syncInventory(msg.inventory);
+      } else if (msg.type === 'inventory') {
+        syncInventory(msg.inventory);
+        if (msg.cooldown) syncCooldownFromServer(msg.cooldown);
+      } else if (msg.type === 'shields') {
+        state.shields = msg.shields || [];
+        state.needsRender = true;
+      } else if (msg.type === 'effect') {
+        if (msg.effect?.type === 'bomb') {
+          state.bombFx.push({ x: msg.effect.x, y: msg.effect.y, colorHex: msg.effect.colorHex, start: performance.now() });
+          showToast(`💣 ${msg.effect.author || 'Un joueur'} a lancé une Bombe de Peinture !`, 'info');
+          playPopSound(260);
+        } else if (msg.effect?.type === 'shield') {
+          showToast(`🛡️ ${msg.effect.author || 'Un joueur'} a posé un Bouclier 5×5 !`, 'info');
+        }
+        state.needsRender = true;
+      } else if (msg.type === 'lootbox_drop') {
+        if (msg.nextLootboxDropAt !== undefined) state.nextLootboxDropAt = msg.nextLootboxDropAt;
+        showToast(`🎁 ${msg.winner} vient de recevoir une Lootbox mystère !`, 'success');
+        playPopSound(740);
       } else if (msg.type === 'place_ok') {
         syncCooldownFromServer(msg.cooldown);
+        if (msg.inventory) syncInventory(msg.inventory);
         playPopSound(560);
-        if (navigator.vibrate) navigator.vibrate(12);
+        if (navigator.vibrate) navigator.vibrate(10);
         if (state.selectedPixel && state.selectedPixel.x === msg.x && state.selectedPixel.y === msg.y) {
           inspectPixel(msg.x, msg.y);
         }
       } else if (msg.type === 'place_error') {
         if (msg.cooldown) syncCooldownFromServer(msg.cooldown);
-        showToast(msg.message || 'Action impossible', 'error');
+        if (!isDraggingPaint) showToast(msg.message || 'Action impossible', 'error');
       } else if (msg.type === 'admin_status') {
+        const wasAdmin = state.isAdmin;
         state.isAdmin = Boolean(msg.isAdmin);
         applyConfigUI();
+        if (!state.isAdmin) {
+          closeModal('modalAdmin');
+          if (wasAdmin) showToast('Vos droits administrateur ont été retirés.', 'info');
+        } else if (!wasAdmin) {
+          showToast('👑 Vous disposez maintenant des droits administrateur !', 'success');
+        }
       }
     };
   }
 
-  // ─────────────────────────── Pointer / Touch / Keyboard Controls ───────────────────────────
-  const pointers = new Map(); // pointerId -> { x, y }
+  // ─────────────────────────── Pointer / Touch / Drag-Paint / Keyboard ───────────────────────────
+  const pointers = new Map();
   let dragStart = null;
   let hasDragged = false;
   let pinchStartDist = 0;
   let pinchStartMid = null;
   let pinchStartZoom = 1;
   let spacePressed = false;
+  let isDraggingPaint = false;
+  let lastPaintCell = null;
+  let dragPaintedCells = new Set();
 
   viewport.addEventListener('pointerdown', (e) => {
-    if (e.button === 2) return; // right click handled by contextmenu
+    if (e.button === 2) return;
     viewport.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
     if (pointers.size === 1) {
+      if (state.dragPaintMode && !spacePressed) {
+        isDraggingPaint = true;
+        hasDragged = true;
+        dragPaintedCells = new Set();
+        const { px, py } = screenToWorld(e.clientX, e.clientY);
+        lastPaintCell = { x: px, y: py };
+        state.selectedPixel = { x: px, y: py };
+        paintLineBresenham(px, py, px, py, dragPaintedCells);
+        state.needsRender = true;
+        return;
+      }
       dragStart = { x: e.clientX, y: e.clientY, camX: state.cam.x, camY: state.cam.y };
       hasDragged = false;
     } else if (pointers.size === 2) {
-      hasDragged = true; // prevent tap on pinch release
+      isDraggingPaint = false;
+      hasDragged = true;
       const pts = Array.from(pointers.values());
       pinchStartDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
       pinchStartMid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
@@ -777,7 +971,6 @@
   });
 
   viewport.addEventListener('pointermove', (e) => {
-    // Update desktop hover preview
     if (pointers.size === 0 && e.pointerType === 'mouse') {
       const w = screenToWorld(e.clientX, e.clientY);
       state.hoverPixel = { x: w.px, y: w.py };
@@ -787,6 +980,17 @@
 
     if (!pointers.has(e.pointerId)) return;
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (pointers.size === 1 && isDraggingPaint) {
+      const { px, py } = screenToWorld(e.clientX, e.clientY);
+      if (lastPaintCell && (px !== lastPaintCell.x || py !== lastPaintCell.y)) {
+        paintLineBresenham(lastPaintCell.x, lastPaintCell.y, px, py, dragPaintedCells);
+        lastPaintCell = { x: px, y: py };
+        state.selectedPixel = { x: px, y: py };
+        state.needsRender = true;
+      }
+      return;
+    }
 
     if (pointers.size === 1 && dragStart) {
       const dx = e.clientX - dragStart.x;
@@ -802,14 +1006,11 @@
       const pts = Array.from(pointers.values());
       const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
       const mid = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
-
       const targetZoom = Math.max(state.cam.minZoom, Math.min(state.cam.maxZoom, pinchStartZoom * (dist / pinchStartDist)));
-      // Keep world point under initial pinch midpoint aligned with current midpoint
       const cx = window.innerWidth / 2;
       const cy = window.innerHeight / 2;
       const worldMidX = dragStart.camX + (pinchStartMid.x - cx) / pinchStartZoom;
       const worldMidY = dragStart.camY + (pinchStartMid.y - cy) / pinchStartZoom;
-
       state.cam.zoom = targetZoom;
       state.cam.x = worldMidX - (mid.x - cx) / targetZoom;
       state.cam.y = worldMidY - (mid.y - cy) / targetZoom;
@@ -822,6 +1023,13 @@
     const wasSingle = pointers.size === 1;
     pointers.delete(e.pointerId);
 
+    if (isDraggingPaint) {
+      isDraggingPaint = false;
+      lastPaintCell = null;
+      dragPaintedCells.clear();
+      return;
+    }
+
     if (wasSingle && !hasDragged && !spacePressed && e.type === 'pointerup') {
       const { px, py } = screenToWorld(e.clientX, e.clientY);
       selectPixel(px, py, true);
@@ -830,7 +1038,7 @@
     if (pointers.size === 1) {
       const remaining = Array.from(pointers.values())[0];
       dragStart = { x: remaining.x, y: remaining.y, camX: state.cam.x, camY: state.cam.y };
-      hasDragged = true; // avoid accidental tap after lifting 1 finger from pinch
+      hasDragged = true;
     } else if (pointers.size === 0) {
       dragStart = null;
       pinchStartDist = 0;
@@ -839,19 +1047,13 @@
 
   viewport.addEventListener('pointerup', onPointerEnd);
   viewport.addEventListener('pointercancel', onPointerEnd);
-  viewport.addEventListener('pointerleave', () => {
-    state.hoverPixel = null;
-    state.needsRender = true;
-  });
+  viewport.addEventListener('pointerleave', () => { state.hoverPixel = null; state.needsRender = true; });
 
-  // Mouse wheel zoom centered on cursor
   viewport.addEventListener('wheel', (e) => {
     e.preventDefault();
-    const factor = e.deltaY < 0 ? 1.18 : 1 / 1.18;
-    zoomAt(e.clientX, e.clientY, factor);
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.18 : 1 / 1.18);
   }, { passive: false });
 
-  // Right-click eyedropper
   viewport.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     const { px, py } = screenToWorld(e.clientX, e.clientY);
@@ -864,40 +1066,31 @@
     }
   });
 
-  // Keyboard shortcuts (desktop)
   window.addEventListener('keydown', (e) => {
     if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
-    if (e.code === 'Space') {
-      spacePressed = true;
-      return;
-    }
-    if (e.key === '+' || e.key === '=') {
-      zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.3);
-    } else if (e.key === '-' || e.key === '_') {
-      zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.3);
-    } else if (e.key === 'g' || e.key === 'G') {
-      toggleGrid();
-    } else if (e.key === 'i' || e.key === 'I') {
-      toggleEyedropper();
-    } else if (e.key === 'Enter' && state.selectedPixel) {
-      placeSelectedPixel();
-    } else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
+    if (e.code === 'Space') { spacePressed = true; return; }
+    if (e.key === '+' || e.key === '=') zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.3);
+    else if (e.key === '-' || e.key === '_') zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.3);
+    else if (e.key === 'g' || e.key === 'G') toggleGrid();
+    else if (e.key === 'i' || e.key === 'I') toggleEyedropper();
+    else if (e.key === 'd' || e.key === 'D') toggleDragPaint();
+    else if (e.key === 'Enter' && state.selectedPixel) placeSelectedPixel();
+    else if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
       e.preventDefault();
       if (!state.selectedPixel) {
         selectPixel(Math.floor(state.config.width / 2), Math.floor(state.config.height / 2), false);
       } else {
         const dx = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
         const dy = e.key === 'ArrowDown' ? 1 : e.key === 'ArrowUp' ? -1 : 0;
-        const nx = Math.max(0, Math.min(state.config.width - 1, state.selectedPixel.x + dx));
-        const ny = Math.max(0, Math.min(state.config.height - 1, state.selectedPixel.y + dy));
-        selectPixel(nx, ny, false);
+        selectPixel(
+          Math.max(0, Math.min(state.config.width - 1, state.selectedPixel.x + dx)),
+          Math.max(0, Math.min(state.config.height - 1, state.selectedPixel.y + dy)),
+          false
+        );
       }
     }
   });
-
-  window.addEventListener('keyup', (e) => {
-    if (e.code === 'Space') spacePressed = false;
-  });
+  window.addEventListener('keyup', (e) => { if (e.code === 'Space') spacePressed = false; });
 
   // ─────────────────────────── Side Toolbar Actions ───────────────────────────
   function toggleGrid() {
@@ -912,11 +1105,25 @@
     if (state.eyedropperMode) showToast('Pipette active : touchez un pixel pour copier sa couleur');
   }
 
+  function toggleDragPaint() {
+    state.dragPaintMode = !state.dragPaintMode;
+    el.btnDragPaint.classList.toggle('active', state.dragPaintMode);
+    if (state.dragPaintMode) {
+      const hint = canDragPaintNow()
+        ? '🖌️ Mode Click & Drag actif : glissez pour peindre ! (2 doigts pour zoom/pan)'
+        : '🖌️ Mode Click & Drag actif (idéal avec Frénésie, Admin ou charges multiples !)';
+      showToast(hint, 'info');
+    } else {
+      showToast('Navigation normale (glisser pour déplacer)');
+    }
+  }
+
   document.getElementById('btnZoomIn').addEventListener('click', () => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1.4));
   document.getElementById('btnZoomOut').addEventListener('click', () => zoomAt(window.innerWidth / 2, window.innerHeight / 2, 1 / 1.4));
   document.getElementById('btnResetView').addEventListener('click', centerCamera);
   document.getElementById('btnGrid').addEventListener('click', toggleGrid);
   document.getElementById('btnEyedropper').addEventListener('click', toggleEyedropper);
+  el.btnDragPaint.addEventListener('click', toggleDragPaint);
   document.getElementById('btnDirectMode').addEventListener('click', () => {
     state.directPlaceMode = !state.directPlaceMode;
     document.getElementById('btnDirectMode').classList.toggle('active', state.directPlaceMode);
@@ -939,47 +1146,155 @@
   });
 
   el.btnBrushSize.addEventListener('click', () => {
-    const sizes = [1, 3, 5];
+    const sizes = [1, 3, 5, 7, 9];
     const next = sizes[(sizes.indexOf(state.adminBrushSize) + 1) % sizes.length];
     state.adminBrushSize = next;
     el.btnBrushSize.textContent = `${next}×`;
     state.needsRender = true;
   });
 
+  el.btnBrushShape.addEventListener('click', () => {
+    state.adminBrushShape = state.adminBrushShape === 'square' ? 'circle' : 'square';
+    el.btnBrushShape.textContent = state.adminBrushShape === 'circle' ? '●' : '■';
+    state.needsRender = true;
+  });
+
   // ─────────────────────────── Modals System ───────────────────────────
-  function openModal(id) {
-    document.getElementById(id)?.classList.remove('hidden');
-  }
+  function openModal(id) { document.getElementById(id)?.classList.remove('hidden'); }
   function closeModal(id) {
     document.getElementById(id)?.classList.add('hidden');
     if (id === 'modalTimelapse') stopTimelapse();
   }
-
   document.querySelectorAll('[data-close]').forEach((btn) => {
     btn.addEventListener('click', () => closeModal(btn.getAttribute('data-close')));
   });
   document.querySelectorAll('.modal').forEach((modal) => {
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) closeModal(modal.id);
-    });
+    modal.addEventListener('click', (e) => { if (e.target === modal) closeModal(modal.id); });
+  });
+
+  // ─────────────────────────── Lootbox & Inventory Modal ───────────────────────────
+  function renderLootboxModal() {
+    const inv = state.inventory || { lootboxes: 0, items: {}, activeBoost: null, bonusCharges: 0 };
+    const count = inv.lootboxes || 0;
+    document.getElementById('lootboxCountLabel').textContent =
+      count === 0 ? 'Aucune lootbox en attente' : `${count} Lootbox${count > 1 ? 'es' : ''} prête${count > 1 ? 's' : ''} à ouvrir !`;
+    document.getElementById('btnOpenLootbox').disabled = count <= 0;
+
+    const dropInfo = document.getElementById('nextDropInfo');
+    if (!state.config.lootboxEnabled) {
+      dropInfo.textContent = 'Les drops automatiques sont actuellement désactivés.';
+    } else if (state.nextLootboxDropAt) {
+      const rem = Math.max(0, state.nextLootboxDropAt - (Date.now() + state.serverTimeOffset));
+      dropInfo.textContent = `⏳ Prochain tirage aléatoire dans ${formatCountdown(rem)} (toutes les ${state.config.lootboxIntervalMinutes} min).`;
+    } else {
+      dropInfo.textContent = `🎁 1 lootbox aléatoire toutes les ${state.config.lootboxIntervalMinutes} min.`;
+    }
+
+    const listEl = document.getElementById('inventoryList');
+    listEl.innerHTML = '';
+    for (const def of Object.values(state.lootboxItems)) {
+      const qty = inv.items?.[def.id] || 0;
+      const card = document.createElement('div');
+      card.className = 'inv-card' + (qty > 0 ? ' owned' : '');
+      card.innerHTML = `
+        <div class="inv-head">
+          <span class="inv-title">${def.icon} ${escapeHtml(def.name)}</span>
+          <span class="pill ${qty > 0 ? 'pill-green' : ''}">×${qty}</span>
+        </div>
+        <div class="muted small">${escapeHtml(def.description)}</div>
+        <button class="btn ${qty > 0 ? 'btn-primary' : 'btn-secondary'} btn-sm" ${qty <= 0 ? 'disabled' : ''}>
+          ${qty > 0 ? 'Activer' : def.rarity}
+        </button>
+      `;
+      if (qty > 0) {
+        card.querySelector('button').addEventListener('click', async () => {
+          const r = await fetch('/api/lootbox/activate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ itemId: def.id }),
+          });
+          const d = await r.json();
+          if (!r.ok) {
+            showToast(d.error || 'Activation impossible', 'error');
+            return;
+          }
+          syncInventory(d.inventory);
+          syncCooldownFromServer(d.cooldown);
+          closeModal('modalLootbox');
+          showToast(`${def.icon} ${def.name} activé !`, 'success');
+          if (def.id === 'frenzy' && !state.dragPaintMode) {
+            showToast('💡 Astuce : active 🖌️ pour peindre en glissant pendant la Frénésie !', 'info');
+          }
+        });
+      }
+      listEl.appendChild(card);
+    }
+  }
+
+  el.btnLootbox.addEventListener('click', () => {
+    document.getElementById('lootRevealBox').classList.add('hidden');
+    renderLootboxModal();
+    openModal('modalLootbox');
+  });
+
+  document.getElementById('btnOpenLootbox').addEventListener('click', async () => {
+    const chest = document.getElementById('lootChestAnim');
+    const btn = document.getElementById('btnOpenLootbox');
+    btn.disabled = true;
+    chest.classList.add('shaking');
+    playPopSound(440);
+    await new Promise((r) => setTimeout(r, 450));
+    try {
+      const res = await fetch('/api/lootbox/open', { method: 'POST' });
+      const data = await res.json();
+      chest.classList.remove('shaking');
+      if (!res.ok) {
+        showToast(data.error || 'Impossible d\'ouvrir', 'error');
+        renderLootboxModal();
+        return;
+      }
+      const it = data.item;
+      const box = document.getElementById('lootRevealBox');
+      box.innerHTML = `<span style="font-size:2rem">${it.icon}</span><div><strong>Tu as gagné : ${escapeHtml(it.name)} !</strong><div class="muted small">${escapeHtml(it.description)}</div></div>`;
+      box.classList.remove('hidden');
+      playPopSound(820);
+      syncInventory(data.inventory);
+    } catch {
+      chest.classList.remove('shaking');
+      showToast('Erreur réseau', 'error');
+    }
   });
 
   // ─────────────────────────── Profile Modal ───────────────────────────
   document.getElementById('btnProfile').addEventListener('click', () => {
-    document.getElementById('inputNickname').value = state.nickname;
+    const info = document.getElementById('authentikIdentityInfo');
+    if (state.authentikUser) {
+      info.textContent = `Connecté via Authentik en tant que @${state.authentikUser.username}` +
+        (state.authentikUser.groups?.length ? ` (${state.authentikUser.groups.join(', ')})` : '') +
+        (state.config.lockNicknameToAuthentik ? ' — Pseudo verrouillé par l\'admin.' : '');
+    } else {
+      info.textContent = 'Votre pseudo s\'affiche sur vos pixels et dans le classement.';
+    }
+    const input = document.getElementById('inputNickname');
+    input.value = state.nickname;
+    input.disabled = Boolean(state.config.lockNicknameToAuthentik && state.authentikUser);
     openModal('modalProfile');
   });
 
   document.getElementById('btnSaveProfile').addEventListener('click', () => {
+    if (state.config.lockNicknameToAuthentik && state.authentikUser) {
+      closeModal('modalProfile');
+      return;
+    }
     const val = document.getElementById('inputNickname').value.trim().slice(0, 24);
     state.nickname = val;
     localStorage.setItem('pw_nickname', val);
-    el.nickLabel.textContent = val || 'Pseudo';
+    el.nickLabel.textContent = val || state.authentikUser?.username || 'Pseudo';
     if (state.wsConnected && state.ws) {
       state.ws.send(JSON.stringify({ type: 'set_nickname', nickname: val }));
     }
     closeModal('modalProfile');
-    showToast(val ? `Pseudo enregistré : ${val}` : 'Pseudo effacé', 'success');
+    showToast(val ? `Pseudo enregistré : ${val}` : 'Pseudo réinitialisé', 'success');
   });
 
   // ─────────────────────────── Export Modal ───────────────────────────
@@ -1003,14 +1318,11 @@
     refreshExportPreview();
     openModal('modalExport');
   });
-
   document.getElementById('selectExportScale').addEventListener('change', refreshExportPreview);
-
   document.getElementById('btnDownloadServerPng').addEventListener('click', () => {
     const scale = parseInt(document.getElementById('selectExportScale').value, 10) || 4;
     window.location.href = `/api/export/png?scale=${scale}`;
   });
-
   document.getElementById('btnDownloadClientPng').addEventListener('click', () => {
     const scale = parseInt(document.getElementById('selectExportScale').value, 10) || 4;
     const c = document.createElement('canvas');
@@ -1037,26 +1349,18 @@
       document.getElementById('statDimensions').textContent = `${state.config.width}×${state.config.height}`;
 
       const list = document.getElementById('leaderboardList');
-      if (!data.leaderboard.length) {
-        list.innerHTML = '<div class="muted small">Aucun contributeur nommé pour le moment.</div>';
-      } else {
-        list.innerHTML = data.leaderboard
-          .map((row) => {
+      list.innerHTML = !data.leaderboard.length
+        ? '<div class="muted small">Aucun contributeur pour le moment.</div>'
+        : data.leaderboard.map((row) => {
             const medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : `#${row.rank}`;
             return `<div class="list-row"><span><strong>${medal}</strong> ${escapeHtml(row.name)}</span><span class="mono">${row.count} px</span></div>`;
-          })
-          .join('');
-      }
+          }).join('');
 
       const totalCanvasPx = state.config.width * state.config.height;
-      const bar = document.getElementById('colorStatsBar');
-      bar.innerHTML = data.colors
+      document.getElementById('colorStatsBar').innerHTML = data.colors
         .filter((c) => c.count > 0)
         .sort((a, b) => b.count - a.count)
-        .map((c) => {
-          const pct = (c.count / totalCanvasPx) * 100;
-          return `<div style="width:${pct}%;background:${c.hex}" title="${c.hex}: ${c.count} px (${pct.toFixed(1)}%)"></div>`;
-        })
+        .map((c) => `<div style="width:${(c.count / totalCanvasPx) * 100}%;background:${c.hex}" title="${c.hex}: ${c.count} px"></div>`)
         .join('');
     } catch {
       showToast('Erreur chargement statistiques', 'error');
@@ -1065,7 +1369,6 @@
 
   // ─────────────────────────── Overlay Template Modal ───────────────────────────
   document.getElementById('btnOverlay').addEventListener('click', () => openModal('modalOverlay'));
-
   document.getElementById('inputOverlayFile').addEventListener('change', (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1083,7 +1386,6 @@
     };
     reader.readAsDataURL(file);
   });
-
   ['inputOverlayX', 'inputOverlayY', 'inputOverlayW', 'inputOverlayOpacity'].forEach((id) => {
     document.getElementById(id).addEventListener('input', () => {
       state.overlay.x = parseInt(document.getElementById('inputOverlayX').value, 10) || 0;
@@ -1095,13 +1397,11 @@
       state.needsRender = true;
     });
   });
-
   document.getElementById('btnToggleOverlay').addEventListener('click', () => {
     state.overlay.visible = !state.overlay.visible;
     document.getElementById('btnOverlay').classList.toggle('active', Boolean(state.overlay.img && state.overlay.visible));
     state.needsRender = true;
   });
-
   document.getElementById('btnClearOverlay').addEventListener('click', () => {
     state.overlay.img = null;
     document.getElementById('btnOverlay').classList.remove('active');
@@ -1109,10 +1409,11 @@
     showToast('Calque modèle retiré');
   });
 
-  // ─────────────────────────── Timelapse Replay & WebM Export ───────────────────────────
+  // ─────────────────────────── Timelapse Replay (with Baseline Support) ───────────────────────────
   const tl = {
     events: [],
     palette: [],
+    baselineBytes: null,
     width: 128,
     height: 128,
     index: 0,
@@ -1131,8 +1432,22 @@
     c.width = tl.width;
     c.height = tl.height;
     const tctx = c.getContext('2d');
-    tctx.fillStyle = tl.palette[0] || '#FFFFFF';
-    tctx.fillRect(0, 0, tl.width, tl.height);
+    if (tl.baselineBytes && tl.baselineBytes.length === tl.width * tl.height) {
+      const imgData = tctx.createImageData(tl.width, tl.height);
+      const palRgba = tl.palette.map(hexToRgba);
+      for (let i = 0; i < tl.baselineBytes.length; i++) {
+        const rgba = palRgba[tl.baselineBytes[i]] || [255, 255, 255, 255];
+        const p = i * 4;
+        imgData.data[p] = rgba[0];
+        imgData.data[p + 1] = rgba[1];
+        imgData.data[p + 2] = rgba[2];
+        imgData.data[p + 3] = 255;
+      }
+      tctx.putImageData(imgData, 0, 0);
+    } else {
+      tctx.fillStyle = tl.palette[0] || '#FFFFFF';
+      tctx.fillRect(0, 0, tl.width, tl.height);
+    }
     tl.index = 0;
     updateTlScrubber();
   }
@@ -1156,9 +1471,7 @@
     tlResetCanvas();
     const tctx = tlCanvas().getContext('2d');
     const clamped = Math.max(0, Math.min(tl.events.length, targetIdx));
-    for (let i = 0; i < clamped; i++) {
-      tlApplyEvent(tl.events[i], tctx);
-    }
+    for (let i = 0; i < clamped; i++) tlApplyEvent(tl.events[i], tctx);
     tl.index = clamped;
     updateTlScrubber();
   }
@@ -1178,21 +1491,14 @@
     tl.carry += speed * dt;
     const steps = Math.floor(tl.carry);
     tl.carry -= steps;
-
     if (steps > 0) {
       const tctx = tlCanvas().getContext('2d');
       const end = Math.min(tl.events.length, tl.index + steps);
-      for (let i = tl.index; i < end; i++) {
-        tlApplyEvent(tl.events[i], tctx);
-      }
+      for (let i = tl.index; i < end; i++) tlApplyEvent(tl.events[i], tctx);
       tl.index = end;
       updateTlScrubber();
     }
-
-    if (tl.index >= tl.events.length) {
-      stopTimelapse();
-      return;
-    }
+    if (tl.index >= tl.events.length) { stopTimelapse(); return; }
     tl.rafId = requestAnimationFrame(tlStep);
   }
 
@@ -1210,9 +1516,7 @@
     if (tl.rafId) cancelAnimationFrame(tl.rafId);
     tl.rafId = null;
     document.getElementById('btnTlPlay').textContent = '▶ Lire';
-    if (tl.recorder && tl.recorder.state === 'recording') {
-      tl.recorder.stop();
-    }
+    if (tl.recorder && tl.recorder.state === 'recording') tl.recorder.stop();
   }
 
   document.getElementById('btnTimelapse').addEventListener('click', async () => {
@@ -1229,6 +1533,17 @@
       tl.height = data.height;
       tl.palette = data.palette;
       tl.events = data.events || [];
+      if (data.baselineBase64) {
+        const bin = atob(data.baselineBase64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        tl.baselineBytes = arr;
+      } else {
+        tl.baselineBytes = null;
+      }
+      document.getElementById('tlStartInfo').textContent = data.startTime
+        ? `🎬 Enregistrement démarré le ${new Date(data.startTime).toLocaleString('fr-FR')} (${tl.events.length} actions enregistrées).`
+        : `🎬 Historique complet (${tl.events.length} actions enregistrées).`;
       tlResetCanvas();
       if (tl.events.length > 0) startTimelapse();
     } catch {
@@ -1236,22 +1551,9 @@
     }
   });
 
-  document.getElementById('btnTlPlay').addEventListener('click', () => {
-    if (tl.playing) stopTimelapse();
-    else startTimelapse();
-  });
-
-  document.getElementById('btnTlRestart').addEventListener('click', () => {
-    stopTimelapse();
-    tlResetCanvas();
-    startTimelapse();
-  });
-
-  document.getElementById('tlScrubber').addEventListener('input', (e) => {
-    stopTimelapse();
-    tlSeekTo(parseInt(e.target.value, 10) || 0);
-  });
-
+  document.getElementById('btnTlPlay').addEventListener('click', () => tl.playing ? stopTimelapse() : startTimelapse());
+  document.getElementById('btnTlRestart').addEventListener('click', () => { stopTimelapse(); tlResetCanvas(); startTimelapse(); });
+  document.getElementById('tlScrubber').addEventListener('input', (e) => { stopTimelapse(); tlSeekTo(parseInt(e.target.value, 10) || 0); });
   document.getElementById('btnTlRecord').addEventListener('click', () => {
     const c = tlCanvas();
     if (!c.captureStream || typeof MediaRecorder === 'undefined') {
@@ -1264,15 +1566,13 @@
     tl.recordedChunks = [];
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9') ? 'video/webm;codecs=vp9' : 'video/webm';
     tl.recorder = new MediaRecorder(stream, { mimeType: mime });
-    tl.recorder.ondataavailable = (ev) => {
-      if (ev.data.size > 0) tl.recordedChunks.push(ev.data);
-    };
+    tl.recorder.ondataavailable = (ev) => { if (ev.data.size > 0) tl.recordedChunks.push(ev.data); };
     tl.recorder.onstop = () => {
       const blob = new Blob(tl.recordedChunks, { type: 'video/webm' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `pixel-war-timelapse.webm`;
+      a.download = 'pixel-war-timelapse.webm';
       a.click();
       URL.revokeObjectURL(url);
       showToast('Vidéo Timelapse WebM téléchargée !', 'success');
@@ -1291,21 +1591,20 @@
     document.getElementById('admTitle').value = c.title;
     document.getElementById('admAnnouncement').value = c.announcement || '';
     document.getElementById('admPaused').checked = Boolean(c.manualPaused);
+    document.getElementById('admLockBeforeStart').checked = Boolean(c.lockBeforeStart);
+    document.getElementById('admLockNick').checked = Boolean(c.lockNicknameToAuthentik);
     document.getElementById('admRequireNick').checked = Boolean(c.requireNickname);
     document.getElementById('admAllowSameColor').checked = Boolean(c.allowSameColor);
     document.getElementById('admAllowExport').checked = Boolean(c.allowPublicExport);
     document.getElementById('admAllowTimelapse').checked = Boolean(c.allowTimelapse);
     document.getElementById('admWidth').value = c.width;
     document.getElementById('admHeight').value = c.height;
+    document.getElementById('admStartTime').value = toLocalInputValue(c.startTime);
+    document.getElementById('admEndTime').value = toLocalInputValue(c.endTime);
     document.getElementById('admAutoSnapMin').value = c.autoSnapshotMinutes ?? 15;
-
-    if (c.endTime) {
-      const d = new Date(c.endTime);
-      const localIso = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-      document.getElementById('admEndTime').value = localIso;
-    } else {
-      document.getElementById('admEndTime').value = '';
-    }
+    document.getElementById('admMaxAutoSnaps').value = c.maxAutoSnapshots ?? 48;
+    document.getElementById('admLootEnabled').checked = Boolean(c.lootboxEnabled);
+    document.getElementById('admLootInterval').value = c.lootboxIntervalMinutes ?? 60;
 
     state.admPaletteDraft = [...c.palette];
     renderAdminPaletteEditor();
@@ -1315,7 +1614,7 @@
   function renderPalettePresets() {
     const row = document.getElementById('palettePresetsRow');
     row.innerHTML = '';
-    for (const [key, preset] of Object.entries(state.presets)) {
+    for (const preset of Object.values(state.presets)) {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'chip';
@@ -1351,6 +1650,14 @@
     const res = await fetch('/api/admin/snapshots', { headers: adminHeaders() });
     if (!res.ok) return;
     const data = await res.json();
+    const infoEl = document.getElementById('snapScheduleInfo');
+    if (data.autoSnapshotMinutes > 0 && data.nextAutoSnapshotAt) {
+      const rem = Math.max(0, data.nextAutoSnapshotAt - Date.now());
+      infoEl.textContent = `⏱ Auto-snapshot actif toutes les ${data.autoSnapshotMinutes} min (prochain dans ${formatCountdown(rem)}) • ${data.snapshots.length} snapshot(s) enregistrés.`;
+    } else {
+      infoEl.textContent = `Auto-snapshots désactivés • ${data.snapshots.length} snapshot(s) enregistrés.`;
+    }
+
     const container = document.getElementById('snapshotsList');
     if (!data.snapshots.length) {
       container.innerHTML = '<div class="muted small">Aucun snapshot sauvegardé pour l\'instant.</div>';
@@ -1360,11 +1667,10 @@
     for (const snap of data.snapshots) {
       const row = document.createElement('div');
       row.className = 'list-row';
-      const dateStr = new Date(snap.createdAt).toLocaleString('fr-FR');
       row.innerHTML = `
         <div>
           <strong>${escapeHtml(snap.label)}</strong> <span class="muted small">(${snap.width}×${snap.height})</span><br/>
-          <span class="muted small">${dateStr} • ${snap.totalPixelsPlaced} px</span>
+          <span class="muted small">${new Date(snap.createdAt).toLocaleString('fr-FR')} • ${snap.totalPixelsPlaced} px</span>
         </div>
         <div class="btn-row">
           <a class="btn btn-secondary btn-sm" href="/api/admin/snapshots/${encodeURIComponent(snap.id)}/png">⬇ PNG</a>
@@ -1373,21 +1679,76 @@
         </div>
       `;
       row.querySelector('[data-restore]').addEventListener('click', async () => {
-        if (!confirm(`Restaurer le snapshot "${snap.label}" ? Le canvas actuel sera remplacé.`)) return;
-        const r = await fetch(`/api/admin/snapshots/${encodeURIComponent(snap.id)}/restore`, {
-          method: 'POST',
-          headers: adminHeaders(),
-        });
+        if (!confirm(`Restaurer "${snap.label}" ? Le canvas actuel sera remplacé.`)) return;
+        const r = await fetch(`/api/admin/snapshots/${encodeURIComponent(snap.id)}/restore`, { method: 'POST', headers: adminHeaders() });
         if (r.ok) showToast('Snapshot restauré !', 'success');
       });
       row.querySelector('[data-del]').addEventListener('click', async () => {
-        await fetch(`/api/admin/snapshots/${encodeURIComponent(snap.id)}`, {
-          method: 'DELETE',
-          headers: adminHeaders(),
-        });
+        await fetch(`/api/admin/snapshots/${encodeURIComponent(snap.id)}`, { method: 'DELETE', headers: adminHeaders() });
         refreshSnapshotsList();
       });
       container.appendChild(row);
+    }
+  }
+
+  async function refreshAdminsList() {
+    const res = await fetch('/api/admin/admins', { headers: adminHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+
+    document.getElementById('admGroupsList').innerHTML = data.adminGroups.length
+      ? data.adminGroups.map((g) => `<span class="pill pill-amber">${escapeHtml(g)}</span>`).join('')
+      : '<span class="muted small">Aucun groupe configuré</span>';
+
+    document.getElementById('admEnvUsersList').innerHTML = data.envAdminUsers.length
+      ? data.envAdminUsers.map((u) => `<span class="pill pill-green">${escapeHtml(u)}</span>`).join('')
+      : '<span class="muted small">Aucun utilisateur fixe configuré</span>';
+
+    const dynEl = document.getElementById('admDynamicList');
+    if (!data.dynamicAdmins.length) {
+      dynEl.innerHTML = '<div class="muted small">Aucun admin ajouté manuellement.</div>';
+    } else {
+      dynEl.innerHTML = '';
+      for (const username of data.dynamicAdmins) {
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        row.innerHTML = `<span class="mono">👑 ${escapeHtml(username)}</span><button class="btn btn-danger btn-sm">Retirer</button>`;
+        row.querySelector('button').addEventListener('click', async () => {
+          const r = await fetch('/api/admin/admins', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action: 'remove', username }) });
+          if (!r.ok) { showToast((await r.json().catch(() => ({}))).error || 'Action impossible', 'error'); return; }
+          showToast(`Droits admin retirés à ${username}`, 'info');
+          refreshAdminsList();
+        });
+        dynEl.appendChild(row);
+      }
+    }
+
+    const connEl = document.getElementById('admConnectedUsersList');
+    if (!data.activeUsers.length) {
+      connEl.innerHTML = '<div class="muted small">Aucun utilisateur Authentik connecté.</div>';
+    } else {
+      connEl.innerHTML = '';
+      for (const u of data.activeUsers) {
+        const row = document.createElement('div');
+        row.className = 'list-row';
+        const roleTag = u.isStaticAdmin
+          ? '<span class="pill pill-amber">Admin fixe/groupe</span>'
+          : u.isDynamicAdmin
+            ? '<button class="btn btn-danger btn-sm" data-act="remove">Retirer admin</button>'
+            : '<button class="btn btn-primary btn-sm" data-act="add">+ Promouvoir admin</button>';
+        row.innerHTML = `<span class="small"><strong>${escapeHtml(u.username)}</strong> ${u.groups.length ? `<span class="muted">(${escapeHtml(u.groups.join(', '))})</span>` : ''}</span><span>${roleTag}</span>`;
+        const btn = row.querySelector('button[data-act]');
+        if (btn) {
+          btn.addEventListener('click', async () => {
+            const action = btn.getAttribute('data-act');
+            const r = await fetch('/api/admin/admins', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action, username: u.usernameNorm || u.username }) });
+            if (!r.ok) { showToast((await r.json().catch(() => ({}))).error || 'Action impossible', 'error'); return; }
+            showToast(action === 'add' ? `👑 ${u.username} est maintenant admin !` : `Droits retirés à ${u.username}`, 'success');
+            refreshAdminsList();
+          });
+        }
+        connEl.appendChild(row);
+      }
     }
   }
 
@@ -1406,11 +1767,7 @@
         row.className = 'list-row';
         row.innerHTML = `<span class="mono">${escapeHtml(target)}</span><button class="btn btn-secondary btn-sm">Lever</button>`;
         row.querySelector('button').addEventListener('click', async () => {
-          await fetch('/api/admin/bans', {
-            method: 'POST',
-            headers: adminHeaders(),
-            body: JSON.stringify({ action: 'unban', target }),
-          });
+          await fetch('/api/admin/bans', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action: 'unban', target }) });
           refreshBansList();
         });
         bansEl.appendChild(row);
@@ -1424,41 +1781,36 @@
       row.className = 'list-row';
       const targetId = c.authentikUid ? `ak:${c.authentikUid}` : c.clientId;
       const badge = c.authentikUsername ? `Authentik: ${c.authentikUsername}` : c.clientId.slice(0, 12);
-      row.innerHTML = `
-        <span class="small"><strong>${escapeHtml(c.nickname || 'Anonyme')}</strong> • <span class="mono">${escapeHtml(badge)}</span></span>
-        <button class="btn btn-danger btn-sm">Restreindre</button>
-      `;
+      row.innerHTML = `<span class="small"><strong>${escapeHtml(c.nickname || 'Anonyme')}</strong> • <span class="mono">${escapeHtml(badge)}</span></span><button class="btn btn-danger btn-sm">Restreindre</button>`;
       row.querySelector('button').addEventListener('click', async () => {
-        const r = await fetch('/api/admin/bans', {
-          method: 'POST',
-          headers: adminHeaders(),
-          body: JSON.stringify({ action: 'ban', target: targetId }),
-        });
-        if (r.ok) {
-          showToast('Utilisateur restreint.', 'info');
-          refreshBansList();
-        }
+        const r = await fetch('/api/admin/bans', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action: 'ban', target: targetId }) });
+        if (r.ok) { showToast('Utilisateur restreint.', 'info'); refreshBansList(); }
       });
       clientsEl.appendChild(row);
     }
   }
 
   function showAdminView() {
-    document.getElementById('adminLoginView').classList.toggle('hidden', state.isAdmin);
+    document.getElementById('adminLoginView').classList.toggle('hidden', state.isAdmin || !state.passwordLoginEnabled);
     document.getElementById('adminPanelView').classList.toggle('hidden', !state.isAdmin);
+    document.getElementById('btnAdmLogout').classList.toggle('hidden', !state.passwordLoginEnabled);
     if (state.isAdmin) {
       populateAdminForm();
       refreshSnapshotsList();
+      refreshAdminsList();
       refreshBansList();
     }
   }
 
   document.getElementById('btnAdmin').addEventListener('click', () => {
+    if (!state.isAdmin && !state.passwordLoginEnabled) {
+      showToast('Accès réservé aux administrateurs.', 'error');
+      return;
+    }
     showAdminView();
     openModal('modalAdmin');
   });
 
-  // Admin Tabs
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
@@ -1468,37 +1820,37 @@
     });
   });
 
-  // Cooldown preset chips
   document.querySelectorAll('[data-cd]').forEach((chip) => {
     chip.addEventListener('click', () => {
-      const ms = parseInt(chip.getAttribute('data-cd'), 10);
-      document.getElementById('admCooldownSec').value = (ms / 1000).toString();
+      document.getElementById('admCooldownSec').value = (parseInt(chip.getAttribute('data-cd'), 10) / 1000).toString();
+    });
+  });
+  document.querySelectorAll('[data-snap-min]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document.getElementById('admAutoSnapMin').value = chip.getAttribute('data-snap-min');
+    });
+  });
+  document.querySelectorAll('[data-loot-min]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document.getElementById('admLootInterval').value = chip.getAttribute('data-loot-min');
     });
   });
 
-  // Admin login submit
   document.getElementById('adminLoginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const errEl = document.getElementById('adminLoginError');
     errEl.classList.add('hidden');
-    const password = document.getElementById('inputAdminPassword').value;
     const res = await fetch('/api/admin/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ password: document.getElementById('inputAdminPassword').value }),
     });
     const data = await res.json();
-    if (!res.ok) {
-      errEl.textContent = data.error || 'Connexion refusée';
-      errEl.classList.remove('hidden');
-      return;
-    }
+    if (!res.ok) { errEl.textContent = data.error || 'Connexion refusée'; errEl.classList.remove('hidden'); return; }
     state.isAdmin = true;
     state.adminToken = data.token;
     sessionStorage.setItem('pw_admin_token', data.token);
-    if (state.wsConnected && state.ws) {
-      state.ws.send(JSON.stringify({ type: 'auth_admin', token: data.token }));
-    }
+    if (state.wsConnected && state.ws) state.ws.send(JSON.stringify({ type: 'auth_admin', token: data.token }));
     applyConfigUI();
     showAdminView();
     showToast('Connecté en administrateur !', 'success');
@@ -1512,26 +1864,21 @@
     sessionStorage.removeItem('pw_admin_token');
     applyConfigUI();
     showAdminView();
-    showToast('Déconnecté.');
   });
 
   async function postAdminConfig(patch) {
-    const res = await fetch('/api/admin/config', {
-      method: 'POST',
-      headers: adminHeaders(),
-      body: JSON.stringify(patch),
-    });
+    const res = await fetch('/api/admin/config', { method: 'POST', headers: adminHeaders(), body: JSON.stringify(patch) });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      showToast(err.error || 'Erreur mise à jour', 'error');
+      showToast((await res.json().catch(() => ({}))).error || 'Erreur mise à jour', 'error');
       return false;
     }
-    showToast('✅ Réglages appliqués en direct à tous les joueurs !', 'success');
+    showToast('✅ Réglages appliqués en direct !', 'success');
     return true;
   }
 
   document.getElementById('btnAdmSaveRules').addEventListener('click', () => {
     const cdSec = parseFloat(document.getElementById('admCooldownSec').value);
+    const startRaw = document.getElementById('admStartTime').value;
     const endRaw = document.getElementById('admEndTime').value;
     postAdminConfig({
       cooldownMs: Number.isFinite(cdSec) ? Math.round(cdSec * 1000) : 5000,
@@ -1540,24 +1887,41 @@
       title: document.getElementById('admTitle').value,
       announcement: document.getElementById('admAnnouncement').value,
       paused: document.getElementById('admPaused').checked,
+      lockBeforeStart: document.getElementById('admLockBeforeStart').checked,
+      lockNicknameToAuthentik: document.getElementById('admLockNick').checked,
       requireNickname: document.getElementById('admRequireNick').checked,
       allowSameColor: document.getElementById('admAllowSameColor').checked,
       allowPublicExport: document.getElementById('admAllowExport').checked,
       allowTimelapse: document.getElementById('admAllowTimelapse').checked,
+      startTime: startRaw ? new Date(startRaw).toISOString() : null,
       endTime: endRaw ? new Date(endRaw).toISOString() : null,
     });
   });
 
+  document.getElementById('btnAdmStartNow').addEventListener('click', async () => {
+    const res = await fetch('/api/admin/start-now', { method: 'POST', headers: adminHeaders() });
+    if (res.ok) {
+      const d = await res.json();
+      document.getElementById('admStartTime').value = toLocalInputValue(d.startTime);
+      showToast('🚀 Top départ lancé ! L\'enregistrement du replay commence maintenant.', 'success');
+      refreshSnapshotsList();
+    }
+  });
+  document.getElementById('btnAdmClearStartTime').addEventListener('click', () => {
+    document.getElementById('admStartTime').value = '';
+    postAdminConfig({ startTime: null });
+  });
   document.getElementById('btnAdmClearEndTime').addEventListener('click', () => {
     document.getElementById('admEndTime').value = '';
     postAdminConfig({ endTime: null });
   });
 
   document.getElementById('btnAdmResize').addEventListener('click', () => {
-    const w = parseInt(document.getElementById('admWidth').value, 10);
-    const h = parseInt(document.getElementById('admHeight').value, 10);
-    const anchor = document.getElementById('admAnchor').value;
-    postAdminConfig({ width: w, height: h, resizeAnchor: anchor });
+    postAdminConfig({
+      width: parseInt(document.getElementById('admWidth').value, 10),
+      height: parseInt(document.getElementById('admHeight').value, 10),
+      resizeAnchor: document.getElementById('admAnchor').value,
+    });
   });
 
   document.getElementById('btnAdmAddColor').addEventListener('click', () => {
@@ -1567,72 +1931,73 @@
       renderAdminPaletteEditor();
     }
   });
-
-  document.getElementById('btnAdmSavePalette').addEventListener('click', () => {
-    postAdminConfig({ palette: state.admPaletteDraft });
-  });
+  document.getElementById('btnAdmSavePalette').addEventListener('click', () => postAdminConfig({ palette: state.admPaletteDraft }));
 
   document.getElementById('btnAdmClearCanvas').addEventListener('click', async () => {
-    if (!confirm('Effacer tout le canvas ? (Un snapshot de sauvegarde sera créé avant.)')) return;
-    await fetch('/api/admin/clear', {
-      method: 'POST',
-      headers: adminHeaders(),
-      body: JSON.stringify({ fillColor: 0, resetStats: false }),
-    });
+    if (!confirm('Effacer tout le canvas ? (Un snapshot de secours sera créé avant.)')) return;
+    await fetch('/api/admin/clear', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ fillColor: 0, resetStats: false }) });
     refreshSnapshotsList();
   });
-
   document.getElementById('btnAdmFullReset').addEventListener('click', async () => {
     if (!confirm('RESET COMPLET : effacer le canvas, le classement et tout l\'historique timelapse ?')) return;
-    await fetch('/api/admin/clear', {
-      method: 'POST',
-      headers: adminHeaders(),
-      body: JSON.stringify({ fillColor: 0, resetStats: true }),
-    });
+    await fetch('/api/admin/clear', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ fillColor: 0, resetStats: true }) });
     refreshSnapshotsList();
   });
 
+  document.getElementById('btnAdmSaveAutoSnap').addEventListener('click', async () => {
+    const ok = await postAdminConfig({
+      autoSnapshotMinutes: parseInt(document.getElementById('admAutoSnapMin').value, 10) || 0,
+      maxAutoSnapshots: parseInt(document.getElementById('admMaxAutoSnaps').value, 10) || 0,
+    });
+    if (ok) refreshSnapshotsList();
+  });
   document.getElementById('btnAdmCreateSnap').addEventListener('click', async () => {
     const label = document.getElementById('admSnapLabel').value.trim() || 'manual';
-    const res = await fetch('/api/admin/snapshots', {
-      method: 'POST',
-      headers: adminHeaders(),
-      body: JSON.stringify({ label }),
-    });
+    const res = await fetch('/api/admin/snapshots', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ label }) });
     if (res.ok) {
       document.getElementById('admSnapLabel').value = '';
-      showToast('📸 Snapshot créé sur le serveur !', 'success');
+      showToast('📸 Snapshot créé !', 'success');
       refreshSnapshotsList();
     }
   });
 
-  document.getElementById('btnAdmSaveAutoSnap').addEventListener('click', () => {
-    const mins = parseInt(document.getElementById('admAutoSnapMin').value, 10) || 0;
-    postAdminConfig({ autoSnapshotMinutes: mins });
+  document.getElementById('btnAdmSaveLoot').addEventListener('click', () => {
+    postAdminConfig({
+      lootboxEnabled: document.getElementById('admLootEnabled').checked,
+      lootboxIntervalMinutes: parseInt(document.getElementById('admLootInterval').value, 10) || 60,
+    });
   });
 
-  // Admin Image Import (quantizes to active palette and sends patch)
+  async function triggerLootDrop(username = '') {
+    const res = await fetch('/api/admin/lootbox/drop', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ username }),
+    });
+    const d = await res.json();
+    if (!res.ok) { showToast(d.error || 'Drop impossible', 'error'); return; }
+    showToast(`🎁 Lootbox envoyée à ${d.winner} !`, 'success');
+  }
+  document.getElementById('btnAdmDropRandom').addEventListener('click', () => triggerLootDrop(''));
+  document.getElementById('btnAdmDropTarget').addEventListener('click', () => {
+    const u = document.getElementById('admLootTargetInput').value.trim();
+    if (!u) return;
+    triggerLootDrop(u);
+    document.getElementById('admLootTargetInput').value = '';
+  });
+
   document.getElementById('btnAdmImportImg').addEventListener('click', async () => {
     const file = document.getElementById('admImportFile').files?.[0];
-    if (!file) {
-      showToast('Sélectionnez une image d\'abord.', 'error');
-      return;
-    }
+    if (!file) { showToast('Sélectionnez une image d\'abord.', 'error'); return; }
     const startX = parseInt(document.getElementById('admImportX').value, 10) || 0;
     const startY = parseInt(document.getElementById('admImportY').value, 10) || 0;
     const targetW = Math.max(4, Math.min(500, parseInt(document.getElementById('admImportW').value, 10) || 48));
 
     const img = await new Promise((resolve, reject) => {
       const r = new FileReader();
-      r.onload = () => {
-        const i = new Image();
-        i.onload = () => resolve(i);
-        i.onerror = reject;
-        i.src = r.result;
-      };
+      r.onload = () => { const i = new Image(); i.onload = () => resolve(i); i.onerror = reject; i.src = r.result; };
       r.readAsDataURL(file);
     });
-
     const targetH = Math.max(1, Math.round(targetW * (img.height / Math.max(1, img.width))));
     const tmp = document.createElement('canvas');
     tmp.width = targetW;
@@ -1645,61 +2010,52 @@
     for (let y = 0; y < targetH; y++) {
       for (let x = 0; x < targetW; x++) {
         const p = (y * targetW + x) * 4;
-        const a = imgData[p + 3];
-        if (a < 128) continue; // skip transparent pixels
+        if (imgData[p + 3] < 128) continue;
         const r = imgData[p], g = imgData[p + 1], b = imgData[p + 2];
-        // Find nearest palette color
-        let bestIdx = 0;
-        let bestDist = Infinity;
+        let bestIdx = 0, bestDist = Infinity;
         for (let ci = 0; ci < state.paletteRgba.length; ci++) {
           const pr = state.paletteRgba[ci];
           const d = (r - pr[0]) ** 2 + (g - pr[1]) ** 2 + (b - pr[2]) ** 2;
-          if (d < bestDist) {
-            bestDist = d;
-            bestIdx = ci;
-          }
+          if (d < bestDist) { bestDist = d; bestIdx = ci; }
         }
         pixels.push({ x: startX + x, y: startY + y, c: bestIdx });
       }
     }
-
     const res = await fetch('/api/admin/import', {
       method: 'POST',
       headers: adminHeaders(),
       body: JSON.stringify({ pixels, author: state.nickname || 'Admin' }),
     });
-    if (res.ok) {
-      const d = await res.json();
-      showToast(`Image importée (${d.applied} pixels dessinés) !`, 'success');
-    } else {
-      showToast('Erreur lors de l\'import.', 'error');
-    }
+    if (res.ok) showToast(`Image importée (${(await res.json()).applied} pixels) !`, 'success');
+    else showToast('Erreur import.', 'error');
   });
+
+  document.getElementById('btnAdmAddAdmin').addEventListener('click', async () => {
+    const input = document.getElementById('admAddAdminInput');
+    const username = input.value.trim();
+    if (!username) return;
+    const res = await fetch('/api/admin/admins', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action: 'add', username }) });
+    if (!res.ok) { showToast((await res.json().catch(() => ({}))).error || 'Erreur ajout admin', 'error'); return; }
+    input.value = '';
+    showToast(`👑 ${username} ajouté comme administrateur !`, 'success');
+    refreshAdminsList();
+  });
+  document.getElementById('btnAdmRefreshAdmins').addEventListener('click', refreshAdminsList);
 
   document.getElementById('btnAdmBan').addEventListener('click', async () => {
     const target = document.getElementById('admBanInput').value.trim();
     if (!target) return;
-    const res = await fetch('/api/admin/bans', {
-      method: 'POST',
-      headers: adminHeaders(),
-      body: JSON.stringify({ action: 'ban', target }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      showToast(err.error || 'Restriction refusée', 'error');
-      return;
-    }
+    const res = await fetch('/api/admin/bans', { method: 'POST', headers: adminHeaders(), body: JSON.stringify({ action: 'ban', target }) });
+    if (!res.ok) { showToast((await res.json().catch(() => ({}))).error || 'Restriction refusée', 'error'); return; }
     document.getElementById('admBanInput').value = '';
     refreshBansList();
   });
-
   document.getElementById('btnAdmRefreshBans').addEventListener('click', refreshBansList);
 
   function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
   }
 
-  // ─────────────────────────── Init ───────────────────────────
   window.addEventListener('resize', resizeViewport);
   resizeViewport();
   requestAnimationFrame(renderFrame);

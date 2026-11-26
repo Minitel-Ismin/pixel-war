@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const zlib = require('node:zlib');
 
 const { WebSocketServer } = require('./ws');
-const { PixelWarStore, PALETTE_PRESETS, sanitizeNickname } = require('./store');
+const { PixelWarStore, PALETTE_PRESETS, LOOTBOX_ITEMS, sanitizeNickname, normalizeUsername } = require('./store');
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -20,29 +20,68 @@ const MIME_TYPES = {
   '.webmanifest': 'application/manifest+json',
 };
 
+function renderAuthRequiredHTML(loginUrl) {
+  const safeUrl = String(loginUrl || 'https://auth.minitel.dev').replace(/"/g, '&quot;');
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Connexion Authentik requise — Pixel War</title>
+  <style>
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #090d16; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; }
+    .card { max-width: 440px; width: 100%; background: rgba(15,23,42,0.94); border: 1px solid rgba(255,255,255,0.14); border-radius: 16px; padding: 28px; text-align: center; box-shadow: 0 12px 32px rgba(0,0,0,0.5); }
+    h1 { margin: 0 0 12px; font-size: 1.3rem; }
+    p { margin: 0 0 20px; color: #94a3b8; line-height: 1.5; font-size: 0.95rem; }
+    a { display: inline-block; background: #2563eb; color: #fff; text-decoration: none; font-weight: 600; padding: 11px 18px; border-radius: 10px; }
+    a:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🔒 Connexion Authentik requise</h1>
+    <p>L'accès à la Pixel War est réservé aux utilisateurs authentifiés via <strong>Authentik MINITEL</strong>. Connectez-vous avec votre compte pour accéder au canvas.</p>
+    <a href="${safeUrl}">Se connecter avec Authentik</a>
+  </div>
+</body>
+</html>`;
+}
+
 function createServer(options = {}) {
   const port = options.port ?? parseInt(process.env.PORT || '3000', 10);
   const host = options.host ?? process.env.HOST ?? '0.0.0.0';
   const trustProxy = options.trustProxy ?? (process.env.TRUST_PROXY !== 'false');
-  const trustAuthentik = options.trustAuthentik ?? (process.env.TRUST_AUTHENTIK_HEADERS === 'true');
+
+  const requireAuthentik = options.requireAuthentik ?? (process.env.REQUIRE_AUTHENTIK !== 'false');
+  const trustAuthentik = options.trustAuthentik ?? (requireAuthentik || process.env.TRUST_AUTHENTIK_HEADERS === 'true');
+  const authentikLoginUrl = options.authentikLoginUrl ?? process.env.AUTHENTIK_LOGIN_URL ?? 'https://auth.minitel.dev/if/user/';
+
   const authentikAdminGroups = new Set(
     String(options.authentikAdminGroups ?? process.env.AUTHENTIK_ADMIN_GROUPS ?? 'admins-infra')
       .split(',')
       .map((g) => g.trim().toLowerCase())
       .filter(Boolean)
   );
-  const adminPassword = options.adminPassword ?? process.env.ADMIN_PASSWORD ?? 'promo-admin-2026';
+
+  const envAdminUsers = new Set(
+    String(options.adminUsers ?? process.env.ADMIN_USERS ?? '')
+      .split(',')
+      .map((u) => normalizeUsername(u))
+      .filter(Boolean)
+  );
+
+  const rawAdminPw = options.adminPassword !== undefined ? options.adminPassword : (process.env.ADMIN_PASSWORD || '');
+  const adminPassword = String(rawAdminPw || '').trim();
+  const passwordLoginEnabled = adminPassword.length > 0;
+
   const sessionSecret = options.sessionSecret ?? process.env.SESSION_SECRET ?? crypto.randomBytes(32).toString('hex');
   const publicDir = options.publicDir || path.join(__dirname, '..', 'public');
 
   const store = new PixelWarStore({ dataDir: options.dataDir });
 
-  // Active admin sessions: token -> expiresAt
   const adminSessions = new Map();
-  // Rate-limit admin login by signed clientId (NEVER by IP: all MINITEL traffic shares VPS IP)
   const loginAttempts = new Map();
 
-  // Binary WS frame: [0x01, x_hi, x_lo, y_hi, y_lo, colorIndex]
   function encodePixelBinary(x, y, color) {
     const buf = Buffer.allocUnsafe(6);
     buf[0] = 0x01;
@@ -61,22 +100,58 @@ function createServer(options = {}) {
   function getAuthentikIdentity(req) {
     if (!trustAuthentik) return null;
     const uid = String(req.headers['x-authentik-uid'] || '').trim();
-    const username = sanitizeNickname(String(req.headers['x-authentik-username'] || ''));
+    const rawUsername = String(req.headers['x-authentik-username'] || '').trim();
+    const username = sanitizeNickname(rawUsername);
     if (!uid && !username) return null;
+
     const name = sanitizeNickname(String(req.headers['x-authentik-name'] || '')) || username;
+    const email = String(req.headers['x-authentik-email'] || '').trim().slice(0, 120);
     const rawGroups = String(req.headers['x-authentik-groups'] || '');
     const groups = rawGroups
       .split(/[|,]/)
       .map((g) => g.trim())
       .filter(Boolean);
-    const isAdminGroup = groups.some((g) => authentikAdminGroups.has(g.toLowerCase()));
+
     return {
-      uid: uid || username,
+      uid: uid || normalizeUsername(rawUsername),
       username: username || name,
+      usernameNorm: normalizeUsername(rawUsername || username),
       name,
+      email,
       groups,
-      isAdmin: isAdminGroup,
     };
+  }
+
+  function isStaticAuthentikAdmin(ak) {
+    if (!ak) return false;
+    if (ak.groups.some((g) => authentikAdminGroups.has(g.toLowerCase()))) return true;
+    if (ak.usernameNorm && envAdminUsers.has(ak.usernameNorm)) return true;
+    if (ak.uid && envAdminUsers.has(normalizeUsername(ak.uid))) return true;
+    return false;
+  }
+
+  function isDynamicAuthentikAdmin(ak) {
+    if (!ak) return false;
+    if (ak.usernameNorm && store.hasExtraAdmin(ak.usernameNorm)) return true;
+    if (ak.uid && store.hasExtraAdmin(ak.uid)) return true;
+    return false;
+  }
+
+  function hasValidAdminToken(token) {
+    if (!passwordLoginEnabled || !token) return false;
+    const exp = adminSessions.get(token);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      adminSessions.delete(token);
+      return false;
+    }
+    return true;
+  }
+
+  function isIdentityAdmin(ak, token) {
+    if (isStaticAuthentikAdmin(ak) || isDynamicAuthentikAdmin(ak)) return true;
+    if (hasValidAdminToken(token)) return true;
+    return false;
   }
 
   function parseCookies(req) {
@@ -132,17 +207,32 @@ function createServer(options = {}) {
   }
 
   function isAdmin(req) {
-    const ak = getAuthentikIdentity(req);
-    if (ak && ak.isAdmin) return true;
-    const token = getAdminToken(req);
-    if (!token) return false;
-    const exp = adminSessions.get(token);
-    if (!exp) return false;
-    if (Date.now() > exp) {
-      adminSessions.delete(token);
-      return false;
+    return isIdentityAdmin(getAuthentikIdentity(req), getAdminToken(req));
+  }
+
+  function notifyUserAdminStatus(targetUsernameNorm) {
+    for (const client of wss.clients) {
+      if (!client.meta || !client.meta.authentik) continue;
+      const ak = client.meta.authentik;
+      if (ak.usernameNorm === targetUsernameNorm || normalizeUsername(ak.uid) === targetUsernameNorm) {
+        const nowAdmin = isIdentityAdmin(ak, client.meta.adminToken);
+        client.meta.isAdmin = nowAdmin;
+        client.sendJSON({ type: 'admin_status', isAdmin: nowAdmin });
+      }
     }
-    return true;
+  }
+
+  function pushInventoryToUser(userKey) {
+    const inv = store.getInventory(userKey);
+    for (const client of wss.clients) {
+      if (client.meta && client.meta.userKey === userKey) {
+        client.sendJSON({
+          type: 'inventory',
+          inventory: inv,
+          cooldown: store.getCooldownStatus(client.meta.clientId, client.meta.authentikUid, false),
+        });
+      }
+    }
   }
 
   function sendJSON(res, status, data, extraHeaders = {}) {
@@ -180,13 +270,81 @@ function createServer(options = {}) {
     });
   }
 
+  // ─── Random Hourly Lootbox Drop Scheduler ───
+  let lootboxTimer = null;
+  let nextLootboxDropAt = null;
+
+  function dropLootboxToTarget(targetUsername = '') {
+    // Deduplicate connected players by userKey so multiple tabs never multiply odds
+    const uniquePlayers = new Map();
+    for (const c of wss.clients) {
+      if (!c.meta) continue;
+      if (!uniquePlayers.has(c.meta.userKey)) {
+        uniquePlayers.set(c.meta.userKey, {
+          userKey: c.meta.userKey,
+          username: c.meta.authentikUsername || c.meta.nickname || 'Un joueur',
+          usernameNorm: normalizeUsername(c.meta.authentikUsername || c.meta.nickname || ''),
+        });
+      }
+    }
+
+    let winner = null;
+    if (targetUsername) {
+      const targetNorm = normalizeUsername(targetUsername);
+      for (const p of uniquePlayers.values()) {
+        if (p.usernameNorm === targetNorm) {
+          winner = p;
+          break;
+        }
+      }
+      if (!winner && targetNorm) {
+        // Grant offline by authentik username key if not currently connected
+        winner = { userKey: `ak:${targetNorm}`, username: targetUsername.trim(), usernameNorm: targetNorm };
+      }
+    } else {
+      const pool = Array.from(uniquePlayers.values());
+      if (pool.length === 0) return null;
+      winner = pool[crypto.randomInt(0, pool.length)];
+    }
+
+    if (!winner) return null;
+    store.grantLootbox(winner.userKey, 1);
+    pushInventoryToUser(winner.userKey);
+    wss.broadcastJSON({
+      type: 'lootbox_drop',
+      winner: winner.username,
+      nextLootboxDropAt,
+    });
+    return winner;
+  }
+
+  function setupLootboxScheduler() {
+    if (lootboxTimer) {
+      clearInterval(lootboxTimer);
+      lootboxTimer = null;
+    }
+    if (!store.config.lootboxEnabled) {
+      nextLootboxDropAt = null;
+      return;
+    }
+    const intervalMs = Math.max(1, store.config.lootboxIntervalMinutes) * 60 * 1000;
+    nextLootboxDropAt = Date.now() + intervalMs;
+    lootboxTimer = setInterval(() => {
+      nextLootboxDropAt = Date.now() + intervalMs;
+      if (!store.isEffectivelyPaused()) {
+        dropLootboxToTarget('');
+      }
+    }, intervalMs);
+    lootboxTimer.unref();
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       const parsedUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
       const pathname = parsedUrl.pathname;
       const method = req.method || 'GET';
 
-      // Health check for Coolify / Docker
+      // 1. Health check (unique route publique pour Coolify/Docker)
       if (pathname === '/health' || pathname === '/api/health') {
         return sendJSON(res, 200, {
           status: 'ok',
@@ -195,26 +353,56 @@ function createServer(options = {}) {
           width: store.config.width,
           height: store.config.height,
           totalPixelsPlaced: store.totalPixelsPlaced,
+          requireAuthentik,
         });
       }
 
-      // Public API: bootstrap config + signed client cookie (+ optional Authentik identity)
+      if (pathname === '/favicon.svg' && (method === 'GET' || method === 'HEAD')) {
+        const favPath = path.join(publicDir, 'favicon.svg');
+        if (fs.existsSync(favPath)) {
+          const data = fs.readFileSync(favPath);
+          res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Content-Length': data.length });
+          return res.end(method === 'HEAD' ? undefined : data);
+        }
+      }
+
+      // 2. Verrouillage global Authentik
+      const ak = getAuthentikIdentity(req);
+      if (requireAuthentik && !ak) {
+        if (pathname.startsWith('/api/')) {
+          return sendJSON(res, 401, {
+            error: 'Connexion via votre compte Authentik requise.',
+            code: 'AUTH_REQUIRED',
+            loginUrl: authentikLoginUrl,
+          });
+        }
+        const html = renderAuthRequiredHTML(authentikLoginUrl);
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+        return res.end(method === 'HEAD' ? undefined : html);
+      }
+
+      // 3. Routes API utilisateur authentifié
       if (pathname === '/api/config' && method === 'GET') {
         const clientId = ensureClientId(req, res);
-        const ak = getAuthentikIdentity(req);
+        const userKey = store.getUserKey(clientId, ak?.uid || '');
         const admin = isAdmin(req);
         return sendJSON(res, 200, {
           config: store.getPublicConfig(),
           presets: PALETTE_PRESETS,
+          lootboxItems: LOOTBOX_ITEMS,
+          nextLootboxDropAt,
+          shields: store.getActiveShields(),
+          inventory: store.getInventory(userKey),
           online: wss.clients.size,
           cooldown: store.getCooldownStatus(clientId, ak?.uid || '', false),
           isAdmin: admin,
-          authentikUser: ak ? { username: ak.username, name: ak.name, groups: ak.groups } : null,
+          passwordLoginEnabled,
+          requireAuthentik,
+          authentikUser: ak ? { uid: ak.uid, username: ak.username, name: ak.name, groups: ak.groups } : null,
           serverTime: Date.now(),
         });
       }
 
-      // Public API: binary canvas download (gzipped if supported)
       if (pathname === '/api/canvas' && method === 'GET') {
         const rawBuf = Buffer.from(store.pixels.buffer, store.pixels.byteOffset, store.pixels.byteLength);
         const acceptEncoding = String(req.headers['accept-encoding'] || '');
@@ -233,7 +421,6 @@ function createServer(options = {}) {
         return res.end(rawBuf);
       }
 
-      // Public API: inspect single pixel author/timestamp
       if (pathname === '/api/pixel' && method === 'GET') {
         const x = parseInt(parsedUrl.searchParams.get('x') || '-1', 10);
         const y = parseInt(parsedUrl.searchParams.get('y') || '-1', 10);
@@ -242,7 +429,6 @@ function createServer(options = {}) {
         return sendJSON(res, 200, info);
       }
 
-      // Public API: leaderboard & color stats
       if (pathname === '/api/stats' && method === 'GET') {
         return sendJSON(res, 200, {
           ...store.getLeaderboard(25),
@@ -251,17 +437,18 @@ function createServer(options = {}) {
         });
       }
 
-      // Public API: timelapse history
       if (pathname === '/api/history' && method === 'GET') {
         if (!store.config.allowTimelapse && !isAdmin(req)) {
           return sendJSON(res, 403, { error: 'Timelapse désactivé par l\'administrateur.' });
         }
-        const events = store.readHistory(150000);
+        const hist = store.readHistory(150000);
         const body = JSON.stringify({
           width: store.config.width,
           height: store.config.height,
           palette: store.config.palette,
-          events,
+          startTime: hist.startTime,
+          baselineBase64: hist.baselineBase64,
+          events: hist.events,
         });
         const acceptEncoding = String(req.headers['accept-encoding'] || '');
         if (acceptEncoding.includes('gzip')) {
@@ -277,7 +464,6 @@ function createServer(options = {}) {
         return res.end(body);
       }
 
-      // Public/Admin API: export crisp PNG
       if (pathname === '/api/export/png' && method === 'GET') {
         if (!store.config.allowPublicExport && !isAdmin(req)) {
           return sendJSON(res, 403, { error: 'Export désactivé par l\'administrateur.' });
@@ -299,17 +485,52 @@ function createServer(options = {}) {
         }
       }
 
-      // Admin login (rate-limited per signed clientId, NOT by IP!)
-      if (pathname === '/api/admin/login' && method === 'POST') {
+      // Lootbox user actions (open / activate boost)
+      if (pathname === '/api/lootbox/open' && method === 'POST') {
         const clientId = ensureClientId(req, res);
+        const userKey = store.getUserKey(clientId, ak?.uid || '');
+        try {
+          const result = store.openLootbox(userKey);
+          pushInventoryToUser(userKey);
+          return sendJSON(res, 200, { ok: true, ...result });
+        } catch (err) {
+          return sendJSON(res, 400, { error: err.message });
+        }
+      }
+
+      if (pathname === '/api/lootbox/activate' && method === 'POST') {
+        const clientId = ensureClientId(req, res);
+        const userKey = store.getUserKey(clientId, ak?.uid || '');
+        const body = await readJsonBody(req, 8192);
+        try {
+          const result = store.activateBoost(userKey, String(body.itemId || ''));
+          pushInventoryToUser(userKey);
+          return sendJSON(res, 200, {
+            ok: true,
+            ...result,
+            cooldown: store.getCooldownStatus(clientId, ak?.uid || '', false),
+          });
+        } catch (err) {
+          return sendJSON(res, 400, { error: err.message });
+        }
+      }
+
+      // 4. Connexion admin mot de passe de secours (UNIQUEMENT si ADMIN_PASSWORD défini)
+      if (pathname === '/api/admin/login' && method === 'POST') {
+        if (!passwordLoginEnabled) {
+          return sendJSON(res, 403, {
+            error: 'La connexion par mot de passe est désactivée. Les droits administrateur sont gérés via Authentik.',
+          });
+        }
+        const key = ak?.uid || ensureClientId(req, res);
         const now = Date.now();
-        let attempt = loginAttempts.get(clientId);
+        let attempt = loginAttempts.get(key);
         if (!attempt || now > attempt.resetAt) {
           attempt = { count: 0, resetAt: now + 60_000 };
-          loginAttempts.set(clientId, attempt);
+          loginAttempts.set(key, attempt);
         }
         if (attempt.count >= 8) {
-          return sendJSON(res, 429, { error: 'Trop de tentatives sur cette session. Réessayez dans une minute.' });
+          return sendJSON(res, 429, { error: 'Trop de tentatives. Réessayez dans une minute.' });
         }
 
         const body = await readJsonBody(req, 16_384);
@@ -345,19 +566,23 @@ function createServer(options = {}) {
         );
       }
 
-      // All other /api/admin/* endpoints require auth
+      // 5. TOUTES les routes /api/admin/* : strictement réservées aux admins (403 sinon)
       if (pathname.startsWith('/api/admin/')) {
         if (!isAdmin(req)) {
-          return sendJSON(res, 401, { error: 'Authentification administrateur requise.' });
+          return sendJSON(res, 403, { error: 'Accès refusé : droits administrateur requis.' });
         }
 
         if (pathname === '/api/admin/config' && method === 'POST') {
           const body = await readJsonBody(req, 64_000);
           const result = store.updateConfig(body);
+          if (result.lootboxScheduleChanged) {
+            setupLootboxScheduler();
+          }
           wss.broadcastJSON({
             type: 'config',
             config: result.config,
             canvasResized: result.canvasResized,
+            nextLootboxDropAt,
             serverTime: Date.now(),
           });
           if (result.cooldownChanged) {
@@ -370,17 +595,38 @@ function createServer(options = {}) {
               }
             }
           }
-          return sendJSON(res, 200, { ok: true, ...result });
+          return sendJSON(res, 200, { ok: true, ...result, nextLootboxDropAt });
+        }
+
+        // Top départ immédiat : fixe startTime = maintenant, capture l'état initial du replay et déverrouille !
+        if (pathname === '/api/admin/start-now' && method === 'POST') {
+          const nowIso = new Date().toISOString();
+          store.updateConfig({ startTime: nowIso, paused: false });
+          const baseline = store.captureReplayBaseline(true);
+          wss.broadcastJSON({
+            type: 'config',
+            config: store.getPublicConfig(),
+            nextLootboxDropAt,
+            serverTime: Date.now(),
+          });
+          return sendJSON(res, 200, { ok: true, startTime: nowIso, baseline, config: store.getPublicConfig() });
+        }
+
+        // Envoyer une lootbox immédiatement (aléatoire ou ciblée)
+        if (pathname === '/api/admin/lootbox/drop' && method === 'POST') {
+          const body = await readJsonBody(req, 8192);
+          const winner = dropLootboxToTarget(String(body.username || '').trim());
+          if (!winner) {
+            return sendJSON(res, 400, { error: 'Aucun joueur connecté pour recevoir une lootbox.' });
+          }
+          return sendJSON(res, 200, { ok: true, winner: winner.username });
         }
 
         if (pathname === '/api/admin/clear' && method === 'POST') {
           const body = await readJsonBody(req, 16_384);
           store.clearCanvas(body.fillColor ?? 0, Boolean(body.resetStats));
-          wss.broadcastJSON({
-            type: 'reload_canvas',
-            config: store.getPublicConfig(),
-            reason: 'clear',
-          });
+          wss.broadcastJSON({ type: 'reload_canvas', config: store.getPublicConfig(), reason: 'clear' });
+          wss.broadcastJSON({ type: 'shields', shields: store.getActiveShields() });
           return sendJSON(res, 200, { ok: true, config: store.getPublicConfig() });
         }
 
@@ -389,17 +635,19 @@ function createServer(options = {}) {
           if (!Array.isArray(body.pixels)) {
             return sendJSON(res, 400, { error: 'Format pixels invalide.' });
           }
-          const count = store.applyBatchPixels(body.pixels, sanitizeNickname(body.author || 'Admin'));
-          wss.broadcastJSON({
-            type: 'reload_canvas',
-            config: store.getPublicConfig(),
-            reason: 'import',
-          });
+          const author = ak?.username || sanitizeNickname(body.author || 'Admin');
+          const count = store.applyBatchPixels(body.pixels, author);
+          wss.broadcastJSON({ type: 'reload_canvas', config: store.getPublicConfig(), reason: 'import' });
           return sendJSON(res, 200, { ok: true, applied: count });
         }
 
         if (pathname === '/api/admin/snapshots' && method === 'GET') {
-          return sendJSON(res, 200, { snapshots: store.listSnapshots() });
+          return sendJSON(res, 200, {
+            snapshots: store.listSnapshots(),
+            autoSnapshotMinutes: store.config.autoSnapshotMinutes,
+            maxAutoSnapshots: store.config.maxAutoSnapshots,
+            nextAutoSnapshotAt: store.nextAutoSnapshotAt,
+          });
         }
 
         if (pathname === '/api/admin/snapshots' && method === 'POST') {
@@ -411,11 +659,7 @@ function createServer(options = {}) {
         if (pathname.startsWith('/api/admin/snapshots/') && pathname.endsWith('/restore') && method === 'POST') {
           const id = pathname.slice('/api/admin/snapshots/'.length, -'/restore'.length);
           const meta = store.restoreSnapshot(decodeURIComponent(id));
-          wss.broadcastJSON({
-            type: 'reload_canvas',
-            config: store.getPublicConfig(),
-            reason: 'restore',
-          });
+          wss.broadcastJSON({ type: 'reload_canvas', config: store.getPublicConfig(), reason: 'restore' });
           return sendJSON(res, 200, { ok: true, snapshot: meta, config: store.getPublicConfig() });
         }
 
@@ -438,6 +682,57 @@ function createServer(options = {}) {
           return sendJSON(res, 200, { ok: true });
         }
 
+        if (pathname === '/api/admin/admins' && method === 'GET') {
+          const connectedMap = new Map();
+          for (const c of wss.clients) {
+            if (c.meta && c.meta.authentik) {
+              const u = c.meta.authentik;
+              connectedMap.set(u.usernameNorm || u.uid, {
+                username: u.username,
+                usernameNorm: u.usernameNorm,
+                name: u.name,
+                uid: u.uid,
+                groups: u.groups,
+                isStaticAdmin: isStaticAuthentikAdmin(u),
+                isDynamicAdmin: isDynamicAuthentikAdmin(u),
+                isAdmin: isIdentityAdmin(u, c.meta.adminToken),
+              });
+            }
+          }
+          return sendJSON(res, 200, {
+            adminGroups: Array.from(authentikAdminGroups),
+            envAdminUsers: Array.from(envAdminUsers).sort(),
+            dynamicAdmins: store.listExtraAdmins(),
+            activeUsers: Array.from(connectedMap.values()),
+            currentUser: ak ? ak.usernameNorm : null,
+          });
+        }
+
+        if (pathname === '/api/admin/admins' && method === 'POST') {
+          const body = await readJsonBody(req, 16_384);
+          const action = body.action === 'remove' ? 'remove' : 'add';
+          const norm = normalizeUsername(body.username || '');
+          if (!norm) {
+            return sendJSON(res, 400, { error: 'Veuillez renseigner un identifiant Authentik valide.' });
+          }
+
+          if (action === 'add') {
+            store.addExtraAdmin(norm);
+            notifyUserAdminStatus(norm);
+          } else {
+            if (envAdminUsers.has(norm)) {
+              return sendJSON(res, 400, { error: 'Cet administrateur est défini dans les variables Coolify (ADMIN_USERS).' });
+            }
+            if (ak && ak.usernameNorm === norm && !isStaticAuthentikAdmin(ak)) {
+              return sendJSON(res, 400, { error: 'Vous ne pouvez pas retirer vos propres droits administrateur.' });
+            }
+            store.removeExtraAdmin(norm);
+            notifyUserAdminStatus(norm);
+          }
+
+          return sendJSON(res, 200, { ok: true, dynamicAdmins: store.listExtraAdmins() });
+        }
+
         if (pathname === '/api/admin/bans' && method === 'GET') {
           const activeClients = [];
           for (const c of wss.clients) {
@@ -450,20 +745,14 @@ function createServer(options = {}) {
               });
             }
           }
-          return sendJSON(res, 200, {
-            banned: Array.from(store.bannedSet),
-            activeClients,
-          });
+          return sendJSON(res, 200, { banned: Array.from(store.bannedSet), activeClients });
         }
 
         if (pathname === '/api/admin/bans' && method === 'POST') {
           const body = await readJsonBody(req, 16_384);
           try {
-            if (body.action === 'unban') {
-              store.unbanTarget(body.target);
-            } else {
-              store.banTarget(body.target);
-            }
+            if (body.action === 'unban') store.unbanTarget(body.target);
+            else store.banTarget(body.target);
           } catch (err) {
             return sendJSON(res, 400, { error: err.message });
           }
@@ -473,7 +762,7 @@ function createServer(options = {}) {
         return sendJSON(res, 404, { error: 'Route admin inconnue.' });
       }
 
-      // Static files from public/
+      // 6. Static files from public/
       if (method === 'GET' || method === 'HEAD') {
         const relPath = pathname === '/' ? '/index.html' : pathname;
         const resolved = path.normalize(path.join(publicDir, relPath));
@@ -497,19 +786,24 @@ function createServer(options = {}) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('404 Not Found');
     } catch (err) {
-      if (err.message === 'BODY_TOO_LARGE') {
-        return sendJSON(res, 413, { error: 'Requête trop volumineuse.' });
-      }
-      if (err.message === 'INVALID_JSON') {
-        return sendJSON(res, 400, { error: 'JSON invalide.' });
-      }
+      if (err.message === 'BODY_TOO_LARGE') return sendJSON(res, 413, { error: 'Requête trop volumineuse.' });
+      if (err.message === 'INVALID_JSON') return sendJSON(res, 400, { error: 'JSON invalide.' });
       console.error('[HTTP] Erreur:', err);
       return sendJSON(res, 500, { error: 'Erreur interne du serveur.' });
     }
   });
 
-  // WebSocket server (same HTTP port 3000, zero extra VPS/firewall ports needed)
-  const wss = new WebSocketServer(server, { path: '/ws', pingIntervalMs: 25000 });
+  const wss = new WebSocketServer(server, {
+    path: '/ws',
+    pingIntervalMs: 25000,
+    verifyClient: (req) => {
+      if (requireAuthentik) {
+        const ak = getAuthentikIdentity(req);
+        if (!ak) return { ok: false, status: 401 };
+      }
+      return { ok: true };
+    },
+  });
 
   let onlineBroadcastTimer = null;
   function broadcastOnlineCount() {
@@ -526,15 +820,19 @@ function createServer(options = {}) {
     const existingCid = verifySignedClientId(cookies.pw_cid);
     const clientId = existingCid || `ws_${crypto.randomBytes(8).toString('hex')}`;
     const ak = getAuthentikIdentity(req);
-    const admin = isAdmin(req);
+    const adminToken = getAdminToken(req);
+    const admin = isIdentityAdmin(ak, adminToken);
+    const userKey = store.getUserKey(clientId, ak?.uid || '');
 
     client.meta = {
       clientId,
+      userKey,
+      authentik: ak,
       authentikUid: ak?.uid || '',
       authentikUsername: ak?.username || '',
+      adminToken,
       isAdmin: admin,
       nickname: ak?.username || '',
-      adminBrush: false,
     };
 
     client.sendJSON({
@@ -542,8 +840,12 @@ function createServer(options = {}) {
       online: wss.clients.size,
       config: store.getPublicConfig(),
       cooldown: store.getCooldownStatus(clientId, client.meta.authentikUid, false),
+      inventory: store.getInventory(userKey),
+      shields: store.getActiveShields(),
+      nextLootboxDropAt,
       isAdmin: admin,
-      authentikUser: ak ? { username: ak.username, name: ak.name, groups: ak.groups } : null,
+      passwordLoginEnabled,
+      authentikUser: ak ? { uid: ak.uid, username: ak.username, name: ak.name, groups: ak.groups } : null,
       serverTime: Date.now(),
     });
 
@@ -559,34 +861,35 @@ function createServer(options = {}) {
       }
 
       if (data.type === 'set_nickname') {
-        client.meta.nickname = sanitizeNickname(data.nickname) || client.meta.authentikUsername;
+        if (store.config.lockNicknameToAuthentik && client.meta.authentikUsername) {
+          client.meta.nickname = client.meta.authentikUsername;
+        } else {
+          client.meta.nickname = sanitizeNickname(data.nickname) || client.meta.authentikUsername;
+        }
         return;
       }
 
       if (data.type === 'auth_admin') {
-        if (ak && ak.isAdmin) {
-          client.meta.isAdmin = true;
-          client.sendJSON({ type: 'admin_status', isAdmin: true });
-          return;
-        }
         const token = String(data.token || '');
-        const exp = adminSessions.get(token);
-        if (exp && Date.now() <= exp) {
-          client.meta.isAdmin = true;
-          client.sendJSON({ type: 'admin_status', isAdmin: true });
-        } else {
-          client.meta.isAdmin = false;
-          client.sendJSON({ type: 'admin_status', isAdmin: false });
-        }
+        if (hasValidAdminToken(token)) client.meta.adminToken = token;
+        const nowAdmin = isIdentityAdmin(client.meta.authentik, client.meta.adminToken);
+        client.meta.isAdmin = nowAdmin;
+        client.sendJSON({ type: 'admin_status', isAdmin: nowAdmin });
         return;
       }
 
       if (data.type === 'place') {
-        const useBypass = Boolean(client.meta.isAdmin && data.adminBypass);
-        const nick = sanitizeNickname(data.nickname || client.meta.nickname || client.meta.authentikUsername);
+        const currentlyAdmin = isIdentityAdmin(client.meta.authentik, client.meta.adminToken);
+        client.meta.isAdmin = currentlyAdmin;
+
+        const useBypass = Boolean(currentlyAdmin && data.adminBypass);
+        const nick = store.config.lockNicknameToAuthentik && client.meta.authentikUsername
+          ? client.meta.authentikUsername
+          : sanitizeNickname(data.nickname || client.meta.nickname || client.meta.authentikUsername);
         client.meta.nickname = nick;
 
         const brush = useBypass ? Math.max(1, Math.min(9, parseInt(data.brushSize || '1', 10) || 1)) : 1;
+        const brushShape = useBypass && data.brushShape === 'circle' ? 'circle' : 'square';
 
         if (brush === 1) {
           const result = store.placePixel({
@@ -610,20 +913,41 @@ function createServer(options = {}) {
             return;
           }
 
-          wss.broadcastBinary(encodePixelBinary(result.pixel.x, result.pixel.y, result.pixel.color));
+          if (Array.isArray(result.pixels)) {
+            for (const [px, py, pc] of result.pixels) {
+              wss.broadcastBinary(encodePixelBinary(px, py, pc));
+            }
+          }
+          if (result.shieldsUpdated) {
+            wss.broadcastJSON({ type: 'shields', shields: store.getActiveShields() });
+          }
+          if (result.effect) {
+            wss.broadcastJSON({
+              type: 'effect',
+              effect: {
+                ...result.effect,
+                colorHex: store.config.palette[result.effect.color] || '#ffffff',
+              },
+            });
+          }
+
           client.sendJSON({
             type: 'place_ok',
-            x: result.pixel.x,
-            y: result.pixel.y,
-            color: result.pixel.color,
+            x: data.x,
+            y: data.y,
+            color: result.pixel ? result.pixel.color : data.color,
             cooldown: result.cooldown,
+            inventory: result.inventory || store.getInventory(client.meta.userKey),
             totalPixelsPlaced: result.totalPixelsPlaced,
           });
         } else {
+          // Admin wide brush (square or circle)
           const half = Math.floor(brush / 2);
+          const radius = brush / 2;
           const batch = [];
           for (let dy = -half; dy <= half; dy++) {
             for (let dx = -half; dx <= half; dx++) {
+              if (brushShape === 'circle' && Math.hypot(dx, dy) > radius) continue;
               const px = (data.x | 0) + dx;
               const py = (data.y | 0) + dy;
               if (px >= 0 && px < store.config.width && py >= 0 && py < store.config.height) {
@@ -651,6 +975,7 @@ function createServer(options = {}) {
         client.sendJSON({
           type: 'cooldown',
           cooldown: store.getCooldownStatus(client.meta.clientId, client.meta.authentikUid, false),
+          inventory: store.getInventory(client.meta.userKey),
           serverTime: Date.now(),
         });
       }
@@ -661,27 +986,50 @@ function createServer(options = {}) {
     });
   });
 
-  // Auto-freeze watcher when endTime is reached
+  // Watchers: auto-start replay baseline, auto-freeze at endTime, shield expiration
   let lastFrozenState = store.isEffectivelyPaused();
-  const freezeWatcher = setInterval(() => {
-    const frozen = store.isEffectivelyPaused();
+  let lastBeforeStart = store.isBeforeStart();
+  const stateWatcher = setInterval(() => {
+    const now = Date.now();
+    const beforeStart = store.isBeforeStart(now);
+    let broadcastCfg = false;
+
+    if (lastBeforeStart && !beforeStart) {
+      // Exact transition into Pixel War startTime -> capture replay baseline!
+      store.captureReplayBaseline(true);
+      broadcastCfg = true;
+    }
+    lastBeforeStart = beforeStart;
+
+    const frozen = store.isEffectivelyPaused(now);
     if (frozen !== lastFrozenState) {
       lastFrozenState = frozen;
-      if (frozen) {
+      if (frozen && store.config.endTime && now >= Date.parse(store.config.endTime)) {
         try {
           store.createSnapshot('fin-evenement');
         } catch {
           // ignore
         }
       }
+      broadcastCfg = true;
+    }
+
+    if (broadcastCfg) {
       wss.broadcastJSON({
         type: 'config',
         config: store.getPublicConfig(),
-        serverTime: Date.now(),
+        nextLootboxDropAt,
+        serverTime: now,
       });
     }
+
+    if (store.pruneExpiredShields(now)) {
+      wss.broadcastJSON({ type: 'shields', shields: store.getActiveShields(now) });
+    }
   }, 1000);
-  freezeWatcher.unref();
+  stateWatcher.unref();
+
+  setupLootboxScheduler();
 
   return {
     server,
@@ -689,14 +1037,12 @@ function createServer(options = {}) {
     store,
     start() {
       return new Promise((resolve) => {
-        server.listen(port, host, () => {
-          const addr = server.address();
-          resolve(addr);
-        });
+        server.listen(port, host, () => resolve(server.address()));
       });
     },
     stop() {
-      clearInterval(freezeWatcher);
+      clearInterval(stateWatcher);
+      if (lootboxTimer) clearInterval(lootboxTimer);
       if (onlineBroadcastTimer) clearTimeout(onlineBroadcastTimer);
       wss.close();
       store.destroy();
@@ -708,10 +1054,8 @@ function createServer(options = {}) {
 if (require.main === module) {
   const app = createServer();
   app.start().then((addr) => {
-    console.log(`[Pixel War] Serveur HTTP+WS démarré sur http://${addr.address}:${addr.port}`);
-    if (!process.env.ADMIN_PASSWORD) {
-      console.warn('[Pixel War] ⚠️  ADMIN_PASSWORD non défini — configurez-le dans Coolify !');
-    }
+    const reqAk = process.env.REQUIRE_AUTHENTIK !== 'false';
+    console.log(`[Pixel War] Serveur HTTP+WS démarré sur http://${addr.address}:${addr.port} (Authentik obligatoire: ${reqAk ? 'OUI' : 'NON'})`);
   });
 
   const shutdown = () => {

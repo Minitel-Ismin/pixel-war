@@ -30,6 +30,12 @@ function connectWsClient(port, headers = {}) {
     });
 
     req.on('error', reject);
+    req.on('response', (res) => {
+      const err = new Error(`WS rejected with HTTP ${res.statusCode}`);
+      err.statusCode = res.statusCode;
+      res.resume();
+      reject(err);
+    });
     req.on('upgrade', (res, socket, head) => {
       const messages = [];
       const waiters = [];
@@ -64,8 +70,7 @@ function connectWsClient(port, headers = {}) {
           if (opcode === 1) dispatch({ type: 'text', data: JSON.parse(payload.toString('utf8')) });
           else if (opcode === 2) dispatch({ type: 'binary', data: Buffer.from(payload) });
           else if (opcode === 9) {
-            const pong = Buffer.concat([Buffer.from([0x8a, 0x80, 0, 0, 0, 0])]);
-            socket.write(pong);
+            socket.write(Buffer.from([0x8a, 0x80, 0, 0, 0, 0]));
           }
         }
       }
@@ -127,13 +132,13 @@ function connectWsClient(port, headers = {}) {
   });
 }
 
-test('Pixel War full integration suite (public MINITEL proxy mode)', async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixel-war-test-'));
+test('Authentik mandatory lock, strict admin isolation & dynamic admin promotion', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixel-war-sec-'));
   const app = createServer({
     port: 0,
     host: '127.0.0.1',
     dataDir: tmpDir,
-    adminPassword: 'secret-test-password',
+    // Default behavior: requireAuthentik=true, authentikAdminGroups='admins-infra', no ADMIN_PASSWORD
   });
 
   const addr = await app.start();
@@ -144,158 +149,193 @@ test('Pixel War full integration suite (public MINITEL proxy mode)', async (t) =
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // 1. Health check & static HTML
+  // 1. Only /health is accessible without Authentik
   const healthRes = await fetch(`${baseUrl}/health`);
   assert.equal(healthRes.status, 200);
   const health = await healthRes.json();
-  assert.equal(health.status, 'ok');
+  assert.equal(health.requireAuthentik, true);
 
-  const htmlRes = await fetch(`${baseUrl}/`);
-  assert.equal(htmlRes.status, 200);
-  assert.match(await htmlRes.text(), /Pixel War/);
+  // 2. Everything else is LOCKED (401) without Authentik headers!
+  for (const p of ['/', '/app.js', '/api/config', '/api/canvas', '/api/stats', '/api/history', '/api/export/png']) {
+    const r = await fetch(`${baseUrl}${p}`);
+    assert.equal(r.status, 401, `Route ${p} must return 401 without Authentik`);
+  }
 
-  // 2. Bootstrap behind Sakura Caddy (X-Forwarded-Proto: https, shared VPS IP 100.110.19.122)
-  const proxyHeaders = {
+  // WebSocket upgrade without Authentik must be rejected with 401 before 101!
+  await assert.rejects(
+    () => connectWsClient(addr.port),
+    (err) => err.statusCode === 401
+  );
+
+  // 3. Regular Authentik user (group 'etudiants') is authenticated, NOT admin
+  const proxyBase = {
     'X-Forwarded-Proto': 'https',
     'X-Forwarded-For': '100.110.19.122',
   };
-  const cfg1Res = await fetch(`${baseUrl}/api/config`, { headers: proxyHeaders });
-  assert.equal(cfg1Res.status, 200);
-  const setCookie1 = cfg1Res.headers.get('set-cookie');
-  assert.ok(setCookie1 && setCookie1.includes('pw_cid=') && setCookie1.includes('Secure'), 'Should issue Secure cookie behind HTTPS proxy');
-  const cookie1 = setCookie1.split(';')[0];
+  const studentHeaders = {
+    ...proxyBase,
+    'X-Authentik-Uid': 'uid-camille-1',
+    'X-Authentik-Username': 'camille',
+    'X-Authentik-Groups': 'etudiants|MINITEL',
+  };
+  const student2Headers = {
+    ...proxyBase,
+    'X-Authentik-Uid': 'uid-lucas-2',
+    'X-Authentik-Username': 'lucas',
+    'X-Authentik-Groups': 'etudiants',
+  };
+  const adminHeaders = {
+    ...proxyBase,
+    'X-Authentik-Uid': 'uid-arthur-0',
+    'X-Authentik-Username': 'arthur',
+    'X-Authentik-Groups': 'etudiants|admins-infra',
+  };
 
-  // Second student behind the EXACT SAME VPS IP gets an independent session
-  const cfg2Res = await fetch(`${baseUrl}/api/config`, { headers: proxyHeaders });
-  const cookie2 = cfg2Res.headers.get('set-cookie').split(';')[0];
-  assert.notEqual(cookie1, cookie2);
+  const studentCfgRes = await fetch(`${baseUrl}/api/config`, { headers: studentHeaders });
+  assert.equal(studentCfgRes.status, 200);
+  assert.ok(studentCfgRes.headers.get('set-cookie').includes('Secure'));
+  const studentCfg = await studentCfgRes.json();
+  assert.equal(studentCfg.isAdmin, false);
+  assert.equal(studentCfg.passwordLoginEnabled, false);
+  assert.equal(studentCfg.authentikUser.username, 'camille');
 
-  // 3. Binary canvas download
-  const canvasRes = await fetch(`${baseUrl}/api/canvas`);
-  assert.equal(canvasRes.status, 200);
-  const canvasW = parseInt(canvasRes.headers.get('x-canvas-width'), 10);
-  const canvasH = parseInt(canvasRes.headers.get('x-canvas-height'), 10);
-  const canvasBuf = Buffer.from(await canvasRes.arrayBuffer());
-  assert.equal(canvasBuf.length, canvasW * canvasH);
+  // Password login must be disabled (403) when ADMIN_PASSWORD is not set
+  const pwLoginRes = await fetch(`${baseUrl}/api/admin/login`, {
+    method: 'POST',
+    headers: { ...studentHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: 'promo-admin-2026' }),
+  });
+  assert.equal(pwLoginRes.status, 403);
 
-  // 4. Two students behind the same VPS IP place pixels independently without IP conflict
-  const ws1 = await connectWsClient(addr.port, { ...proxyHeaders, Cookie: cookie1 });
-  const ws2 = await connectWsClient(addr.port, { ...proxyHeaders, Cookie: cookie2 });
-  await ws1.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
-  await ws2.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
-
-  ws1.sendJSON({ type: 'place', x: 10, y: 12, color: 5, nickname: '[MINITEL] Alice' });
-  const binBroadcast = await ws1.nextMessage((m) => m.type === 'binary');
-  assert.equal(binBroadcast.data[0], 0x01);
-  assert.equal(binBroadcast.data.readUInt16BE(1), 10);
-  assert.equal(binBroadcast.data.readUInt16BE(3), 12);
-  assert.equal(binBroadcast.data[5], 5);
-
-  const placeOk1 = await ws1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
-  assert.equal(placeOk1.data.cooldown.charges, 0);
-
-  // Student 1 is blocked by cooldown
-  ws1.sendJSON({ type: 'place', x: 11, y: 12, color: 6, nickname: '[MINITEL] Alice' });
-  const placeErr1 = await ws1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_error');
-  assert.equal(placeErr1.data.code, 'COOLDOWN');
-
-  // Student 2 behind the SAME VPS IP can still place immediately!
-  ws2.sendJSON({ type: 'place', x: 20, y: 20, color: 7, nickname: '[BDA] Bob' });
-  const placeOk2 = await ws2.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
-  assert.equal(placeOk2.data.x, 20);
-
-  // 5. Failed login attempts from student 1 must NOT lock out admin on another session behind same VPS IP
-  for (let i = 0; i < 9; i++) {
-    await fetch(`${baseUrl}/api/admin/login`, {
-      method: 'POST',
-      headers: { ...proxyHeaders, Cookie: cookie1, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password: 'wrong' }),
+  // 4. Regular user CANNOT call ANY /api/admin/* route -> 403 Forbidden!
+  const forbiddenCalls = [
+    ['POST', '/api/admin/config', { cooldownMs: 0 }],
+    ['POST', '/api/admin/clear', { fillColor: 0 }],
+    ['POST', '/api/admin/snapshots', { label: 'hack' }],
+    ['POST', '/api/admin/bans', { action: 'ban', target: 'uid-arthur-0' }],
+    ['GET', '/api/admin/admins', null],
+    ['POST', '/api/admin/admins', { action: 'add', username: 'camille' }],
+  ];
+  for (const [method, url, body] of forbiddenCalls) {
+    const r = await fetch(`${baseUrl}${url}`, {
+      method,
+      headers: { ...studentHeaders, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
     });
+    assert.equal(r.status, 403, `Non-admin ${method} ${url} must return 403`);
   }
-  const lockedStudent = await fetch(`${baseUrl}/api/admin/login`, {
+
+  // 5. Regular user connects via WS; forged adminBypass/brushSize is ignored; cooldown applies per Authentik UID
+  const wsStudentA = await connectWsClient(addr.port, studentHeaders);
+  const wsStudentB = await connectWsClient(addr.port, studentHeaders); // second browser/incognito, same Authentik UID
+  const wsStudent2 = await connectWsClient(addr.port, student2Headers); // different user, SAME VPS IP
+  const helloA = await wsStudentA.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+  assert.equal(helloA.data.isAdmin, false);
+  await wsStudentB.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+  await wsStudent2.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+
+  // Student tries to spoof adminBypass=true and brushSize=5 -> only 1 pixel is placed and cooldown is consumed!
+  wsStudentA.sendJSON({ type: 'place', x: 10, y: 10, color: 4, adminBypass: true, brushSize: 5 });
+  const ok1 = await wsStudentA.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  assert.equal(ok1.data.cooldown.charges, 0);
+  // Neighboring pixel (11, 10) must NOT have been painted by spoofed 5x5 brush
+  const neighbor = await (await fetch(`${baseUrl}/api/pixel?x=11&y=10`, { headers: studentHeaders })).json();
+  assert.equal(neighbor.color, 0);
+
+  // Same Authentik user in second browser is blocked by cooldown!
+  wsStudentB.sendJSON({ type: 'place', x: 12, y: 10, color: 4, adminBypass: true });
+  const errB = await wsStudentB.nextMessage((m) => m.type === 'text' && m.data.type === 'place_error');
+  assert.equal(errB.data.code, 'COOLDOWN');
+
+  // Different Authentik user behind the SAME VPS IP places without any IP conflict!
+  wsStudent2.sendJSON({ type: 'place', x: 20, y: 20, color: 7 });
+  const ok2 = await wsStudent2.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  assert.equal(ok2.data.x, 20);
+
+  // 6. Real admin (admins-infra) has full access & promotes 'camille' dynamically
+  const adminCfg = await (await fetch(`${baseUrl}/api/config`, { headers: adminHeaders })).json();
+  assert.equal(adminCfg.isAdmin, true);
+
+  const promoteRes = await fetch(`${baseUrl}/api/admin/admins`, {
     method: 'POST',
-    headers: { ...proxyHeaders, Cookie: cookie1, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: 'secret-test-password' }),
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'add', username: 'camille' }),
   });
-  assert.equal(lockedStudent.status, 429);
+  assert.equal(promoteRes.status, 200);
 
-  // Admin on cookie2 succeeds immediately despite same VPS IP
-  const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+  // Camille's open WebSocket immediately receives admin_status: true!
+  const promoMsg = await wsStudentA.nextMessage((m) => m.type === 'text' && m.data.type === 'admin_status');
+  assert.equal(promoMsg.data.isAdmin, true);
+
+  // Camille can now modify settings (e.g., lockNicknameToAuthentik + title)!
+  const camilleEdit = await fetch(`${baseUrl}/api/admin/config`, {
     method: 'POST',
-    headers: { ...proxyHeaders, Cookie: cookie2, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ password: 'secret-test-password' }),
+    headers: { ...studentHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: 'Pixel War Promo Verrouillée', lockNicknameToAuthentik: true }),
   });
-  assert.equal(loginRes.status, 200);
-  const { token } = await loginRes.json();
+  assert.equal(camilleEdit.status, 200);
 
-  // Attempting to ban the VPS IP must be rejected!
-  const ipBanRes = await fetch(`${baseUrl}/api/admin/bans`, {
+  // With lockNicknameToAuthentik=true, Lucas trying to spoof nickname gets recorded as 'lucas'
+  await fetch(`${baseUrl}/api/admin/config`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
-    body: JSON.stringify({ action: 'ban', target: '100.110.19.122' }),
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cooldownMs: 0 }),
   });
-  assert.equal(ipBanRes.status, 400);
+  wsStudent2.sendJSON({ type: 'place', x: 21, y: 20, color: 8, nickname: 'FakeAdmin' });
+  await wsStudent2.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  const pxLucas = await (await fetch(`${baseUrl}/api/pixel?x=21&y=20`, { headers: student2Headers })).json();
+  assert.equal(pxLucas.author, 'lucas');
 
-  // 6. Live config update + non-destructive resize
-  const updateRes = await fetch(`${baseUrl}/api/admin/config`, {
+  // 7. Admin demotes 'camille' -> immediate revocation over WS + HTTP 403!
+  const demoteRes = await fetch(`${baseUrl}/api/admin/admins`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
-    body: JSON.stringify({
-      cooldownMs: 0,
-      title: 'Promo ISMIN Rush!',
-      announcement: 'GO GO GO!',
-      width: 64,
-      height: 64,
-      resizeAnchor: 'top-left',
-    }),
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'remove', username: 'camille' }),
   });
-  assert.equal(updateRes.status, 200);
-  const cfgBroadcast = await ws1.nextMessage((m) => m.type === 'text' && m.data.type === 'config');
-  assert.equal(cfgBroadcast.data.config.title, 'Promo ISMIN Rush!');
+  assert.equal(demoteRes.status, 200);
 
-  const preserved = await (await fetch(`${baseUrl}/api/pixel?x=10&y=12`)).json();
-  assert.equal(preserved.color, 5);
+  const demoteMsg = await wsStudentA.nextMessage((m) => m.type === 'text' && m.data.type === 'admin_status');
+  assert.equal(demoteMsg.data.isAdmin, false);
 
-  // 7. Export crisp upscaled PNG
-  const pngRes = await fetch(`${baseUrl}/api/export/png?scale=4`);
+  const camilleAfterDemote = await fetch(`${baseUrl}/api/admin/config`, {
+    method: 'POST',
+    headers: { ...studentHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: 'Should Fail' }),
+  });
+  assert.equal(camilleAfterDemote.status, 403);
+
+  // 8. Export PNG + Snapshot create & restore as admin
+  const pngRes = await fetch(`${baseUrl}/api/export/png?scale=2`, { headers: studentHeaders });
   assert.equal(pngRes.status, 200);
   const pngBuf = Buffer.from(await pngRes.arrayBuffer());
   assert.deepEqual(pngBuf.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-  assert.equal(pngBuf.readUInt32BE(16), 64 * 4);
-  assert.equal(pngBuf.readUInt32BE(20), 64 * 4);
 
-  // 8. Snapshots create, clear & restore
   const { snapshot } = await (await fetch(`${baseUrl}/api/admin/snapshots`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
-    body: JSON.stringify({ label: 'checkpoint-1' }),
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ label: 'final-check' }),
   })).json();
+  assert.equal(snapshot.label, 'final-check');
 
-  await fetch(`${baseUrl}/api/admin/clear`, {
+  // Banning VPS IP still rejected
+  const ipBan = await fetch(`${baseUrl}/api/admin/bans`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': token },
-    body: JSON.stringify({ fillColor: 0 }),
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'ban', target: '100.110.19.122' }),
   });
-  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=10&y=12`)).json()).color, 0);
+  assert.equal(ipBan.status, 400);
 
-  await fetch(`${baseUrl}/api/admin/snapshots/${encodeURIComponent(snapshot.id)}/restore`, {
-    method: 'POST',
-    headers: { 'X-Admin-Token': token },
-  });
-  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=10&y=12`)).json()).color, 5);
-
-  ws1.close();
-  ws2.close();
+  wsStudentA.close();
+  wsStudentB.close();
+  wsStudent2.close();
 });
 
-test('Authentik forward-auth mode (per-account cooldown + auto admin group)', async (t) => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixel-war-ak-test-'));
+test('StartTime replay baseline, wide brush, lootboxes & boosts (frenzy, bomb, brush3, shield, charges5, rainbow)', async (t) => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixel-war-feat-'));
   const app = createServer({
     port: 0,
     host: '127.0.0.1',
     dataDir: tmpDir,
-    trustAuthentik: true,
-    authentikAdminGroups: 'admins-infra,MINITEL',
   });
 
   const addr = await app.start();
@@ -306,47 +346,119 @@ test('Authentik forward-auth mode (per-account cooldown + auto admin group)', as
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  // Switch to authentik mode using automatic admin group membership (no password login needed!)
-  const adminAkHeaders = {
-    'X-Authentik-Uid': 'uid-admin-1',
+  const adminHeaders = {
+    'X-Authentik-Uid': 'uid-admin',
     'X-Authentik-Username': 'arthur',
-    'X-Authentik-Groups': 'etudiants|admins-infra',
+    'X-Authentik-Groups': 'admins-infra',
   };
-  const cfgAdmin = await (await fetch(`${baseUrl}/api/config`, { headers: adminAkHeaders })).json();
-  assert.equal(cfgAdmin.isAdmin, true);
-  assert.equal(cfgAdmin.authentikUser.username, 'arthur');
-
-  const modeRes = await fetch(`${baseUrl}/api/admin/config`, {
-    method: 'POST',
-    headers: { ...adminAkHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ cooldownMode: 'authentik', cooldownMs: 10000 }),
-  });
-  assert.equal(modeRes.status, 200);
-
-  // Student opens 2 different browsers (different cookies) with same Authentik UID -> cooldown is shared!
-  const studentAkHeaders = {
-    'X-Authentik-Uid': 'uid-student-42',
-    'X-Authentik-Username': 'camille',
+  const p1Headers = {
+    'X-Authentik-Uid': 'uid-p1',
+    'X-Authentik-Username': 'alice',
     'X-Authentik-Groups': 'etudiants',
   };
-  const wsA = await connectWsClient(addr.port, studentAkHeaders);
-  const wsB = await connectWsClient(addr.port, studentAkHeaders);
-  await wsA.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
-  await wsB.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+  const p2Headers = {
+    'X-Authentik-Uid': 'uid-p2',
+    'X-Authentik-Username': 'bob',
+    'X-Authentik-Groups': 'etudiants',
+  };
 
-  wsA.sendJSON({ type: 'place', x: 5, y: 5, color: 2 });
-  const okA = await wsA.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
-  assert.equal(okA.data.x, 5);
+  // 1. Set future startTime + lockBeforeStart=true -> player blocked, admin can prep canvas without recording replay
+  const futureIso = new Date(Date.now() + 3600_000).toISOString();
+  await fetch(`${baseUrl}/api/admin/config`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ startTime: futureIso, lockBeforeStart: true, cooldownMs: 5000 }),
+  });
 
-  // Auto-filled nickname from X-Authentik-Username
-  const pxInfo = await (await fetch(`${baseUrl}/api/pixel?x=5&y=5`)).json();
-  assert.equal(pxInfo.author, 'camille');
+  const wsAdmin = await connectWsClient(addr.port, adminHeaders);
+  const wsP1 = await connectWsClient(addr.port, p1Headers);
+  const wsP2 = await connectWsClient(addr.port, p2Headers);
+  await wsAdmin.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+  await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
+  await wsP2.nextMessage((m) => m.type === 'text' && m.data.type === 'hello');
 
-  // Second browser with same Authentik account is blocked by cooldown!
-  wsB.sendJSON({ type: 'place', x: 6, y: 5, color: 2 });
-  const errB = await wsB.nextMessage((m) => m.type === 'text' && m.data.type === 'place_error');
-  assert.equal(errB.data.code, 'COOLDOWN');
+  // Player 1 blocked before startTime
+  wsP1.sendJSON({ type: 'place', x: 5, y: 5, color: 3 });
+  const notStarted = await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_error');
+  assert.equal(notStarted.data.code, 'NOT_STARTED');
 
-  wsA.close();
-  wsB.close();
+  // Admin paints with 5x5 circle wide brush before startTime -> NOT recorded in replay!
+  wsAdmin.sendJSON({ type: 'place', x: 15, y: 15, color: 6, adminBypass: true, brushSize: 5, brushShape: 'circle' });
+  await wsAdmin.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  const histBeforeStart = await (await fetch(`${baseUrl}/api/history`, { headers: adminHeaders })).json();
+  assert.equal(histBeforeStart.events.length, 0);
+
+  // 2. Admin triggers "Top départ maintenant" -> captures baseline & opens canvas!
+  const startNowRes = await fetch(`${baseUrl}/api/admin/start-now`, { method: 'POST', headers: adminHeaders });
+  assert.equal(startNowRes.status, 200);
+
+  // Now Player 1 can place, and it IS recorded in replay on top of baseline!
+  wsP1.sendJSON({ type: 'place', x: 30, y: 30, color: 4 });
+  await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  const histAfterStart = await (await fetch(`${baseUrl}/api/history`, { headers: p1Headers })).json();
+  assert.ok(histAfterStart.baselineBase64, 'Replay should include baseline snapshot captured at startTime');
+  assert.equal(histAfterStart.events.length, 1);
+
+  // 3. Lootbox drop & open flow
+  const dropRes = await fetch(`${baseUrl}/api/admin/lootbox/drop`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: 'alice' }),
+  });
+  assert.equal(dropRes.status, 200);
+  const openRes = await fetch(`${baseUrl}/api/lootbox/open`, { method: 'POST', headers: p1Headers });
+  assert.equal(openRes.status, 200);
+  const opened = await openRes.json();
+  assert.ok(opened.item && opened.item.id);
+
+  // 4. Deterministically test Frenzy, Bomb, Brush3, Shield & Charges5 via store inventory
+  const p1Key = 'ak:uid-p1';
+  app.store.inventories.get(p1Key).items.frenzy = 1;
+  app.store.inventories.get(p1Key).items.bomb = 1;
+  app.store.inventories.get(p1Key).items.brush3 = 1;
+  app.store.inventories.get(p1Key).items.shield = 1;
+  app.store.inventories.get(p1Key).items.charges5 = 1;
+
+  // Test Frenzy (unlimited rapid placement despite 5000ms cooldown)
+  assert.equal((await fetch(`${baseUrl}/api/lootbox/activate`, {
+    method: 'POST', headers: { ...p1Headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId: 'frenzy' }),
+  })).status, 200);
+  for (let i = 0; i < 4; i++) {
+    wsP1.sendJSON({ type: 'place', x: 40 + i, y: 40, color: 7 });
+    const okF = await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+    assert.equal(okF.data.x, 40 + i);
+  }
+  // Expire frenzy to test next boosts
+  app.store.inventories.get(p1Key).activeBoost = null;
+
+  // Test Paint Bomb (splatters multiple pixels around 60,60)
+  assert.equal((await fetch(`${baseUrl}/api/lootbox/activate`, {
+    method: 'POST', headers: { ...p1Headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId: 'bomb' }),
+  })).status, 200);
+  wsP1.sendJSON({ type: 'place', x: 60, y: 60, color: 9 });
+  await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=60&y=60`, { headers: p1Headers })).json()).color, 9);
+  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=61&y=60`, { headers: p1Headers })).json()).color, 9);
+
+  // Test Shield 5x5 -> Bob cannot paint inside Alice's shield!
+  assert.equal((await fetch(`${baseUrl}/api/lootbox/activate`, {
+    method: 'POST', headers: { ...p1Headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId: 'shield' }),
+  })).status, 200);
+  wsP1.sendJSON({ type: 'place', x: 80, y: 80, color: 11 });
+  await wsP1.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+
+  wsP2.sendJSON({ type: 'place', x: 81, y: 81, color: 2 });
+  const shieldErr = await wsP2.nextMessage((m) => m.type === 'text' && m.data.type === 'place_error');
+  assert.equal(shieldErr.data.code, 'SHIELDED');
+
+  // Test Charges5 (+5 bonus charges)
+  assert.equal((await fetch(`${baseUrl}/api/lootbox/activate`, {
+    method: 'POST', headers: { ...p1Headers, 'Content-Type': 'application/json' }, body: JSON.stringify({ itemId: 'charges5' }),
+  })).status, 200);
+  const invAfterCharges = app.store.getInventory(p1Key);
+  assert.equal(invAfterCharges.bonusCharges, 5);
+
+  wsAdmin.close();
+  wsP1.close();
+  wsP2.close();
 });

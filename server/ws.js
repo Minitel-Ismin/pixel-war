@@ -21,7 +21,9 @@ class WebSocketClient extends EventEmitter {
     socket.on('data', (chunk) => this._onData(chunk));
     socket.on('close', () => this._cleanup());
     socket.on('error', (err) => {
-      this.emit('error', err);
+      if (this.listenerCount('error') > 0) {
+        this.emit('error', err);
+      }
       this._cleanup();
     });
   }
@@ -192,7 +194,7 @@ class WebSocketClient extends EventEmitter {
 }
 
 class WebSocketServer extends EventEmitter {
-  constructor(httpServer, { path = '/ws', pingIntervalMs = 25000 } = {}) {
+  constructor(httpServer, { path = '/ws', pingIntervalMs = 25000, verifyClient = null } = {}) {
     super();
     this.path = path;
     this.clients = new Set();
@@ -203,6 +205,17 @@ class WebSocketServer extends EventEmitter {
         socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;
+      }
+
+      if (typeof verifyClient === 'function') {
+        const verdict = verifyClient(req);
+        if (!verdict || verdict.ok === false) {
+          const status = verdict?.status || 401;
+          const reason = status === 403 ? 'Forbidden' : 'Unauthorized';
+          socket.write(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\n\r\n`);
+          socket.destroy();
+          return;
+        }
       }
 
       const key = req.headers['sec-websocket-key'];

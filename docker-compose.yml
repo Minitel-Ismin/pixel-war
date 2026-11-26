@@ -1,4 +1,4 @@
-# Déploiement Coolify sur Isadora (infra MINITEL)
+# Déploiement Coolify sur Isadora (infra MINITEL — Authentik OBLIGATOIRE)
 # - Aucun port publié sur l'hôte (routage HTTP via Traefik coolify-proxy:80)
 # - Aucun accès docker.sock, aucun privilège, pas de réseau hôte
 # - Plafonds RAM/CPU conformes aux règles §9.1
@@ -24,18 +24,25 @@ services:
       TRUST_PROXY: "true"
       DATA_DIR: "/data"
       EVENT_TITLE: "${EVENT_TITLE:-Pixel War ISMIN}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Definir ADMIN_PASSWORD dans Coolify}"
       SESSION_SECRET: "${SESSION_SECRET:?Definir SESSION_SECRET dans Coolify}"
+      # Verrouillage strict : connexion Authentik obligatoire sur HTTP + WebSocket
+      REQUIRE_AUTHENTIK: "${REQUIRE_AUTHENTIK:-true}"
+      TRUST_AUTHENTIK_HEADERS: "${TRUST_AUTHENTIK_HEADERS:-true}"
+      AUTHENTIK_LOGIN_URL: "${AUTHENTIK_LOGIN_URL:-https://auth.minitel.dev/if/user/}"
+      # Seuls les groupes / utilisateurs ci-dessous (+ ceux ajoutés dans l'onglet Admins) sont admins
+      AUTHENTIK_ADMIN_GROUPS: "${AUTHENTIK_ADMIN_GROUPS:-admins-infra}"
+      ADMIN_USERS: "${ADMIN_USERS:-}"
+      # Laisser VIDE pour désactiver le login par mot de passe (recommandé avec Authentik)
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       CANVAS_WIDTH: "${CANVAS_WIDTH:-128}"
       CANVAS_HEIGHT: "${CANVAS_HEIGHT:-128}"
       COOLDOWN_MS: "${COOLDOWN_MS:-5000}"
       MAX_CHARGES: "${MAX_CHARGES:-1}"
-      # 'client' (public, sans limite IP) ou 'authentik' (si forward_auth activé sur Caddy)
-      COOLDOWN_MODE: "${COOLDOWN_MODE:-client}"
-      # Activer UNIQUEMENT si la route passe par Authentik forward_auth sur Sakura/Caddy
-      TRUST_AUTHENTIK_HEADERS: "${TRUST_AUTHENTIK_HEADERS:-false}"
-      AUTHENTIK_ADMIN_GROUPS: "${AUTHENTIK_ADMIN_GROUPS:-admins-infra,MINITEL}"
+      COOLDOWN_MODE: "${COOLDOWN_MODE:-authentik}"
       AUTO_SNAPSHOT_MINUTES: "${AUTO_SNAPSHOT_MINUTES:-15}"
+      MAX_AUTO_SNAPSHOTS: "${MAX_AUTO_SNAPSHOTS:-48}"
+      LOOTBOX_ENABLED: "${LOOTBOX_ENABLED:-true}"
+      LOOTBOX_INTERVAL_MINUTES: "${LOOTBOX_INTERVAL_MINUTES:-60}"
     volumes:
       - pixel_war_data:/data
     healthcheck:

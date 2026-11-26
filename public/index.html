@@ -24,13 +24,17 @@
           <span id="onlineBadge" class="pill pill-green" title="Joueurs connectés">● 0</span>
           <span id="canvasSizeBadge" class="pill">128×128</span>
           <span id="pausedBadge" class="pill pill-red hidden">⏸ FIGÉ</span>
+          <span id="startBadge" class="pill pill-blue hidden">⏳ --:--</span>
           <span id="countdownBadge" class="pill pill-amber hidden">⏱ --:--</span>
         </div>
       </div>
     </div>
 
     <div class="hud-actions glass">
-      <button id="btnProfile" class="icon-btn" title="Pseudo / Faction">
+      <button id="btnLootbox" class="icon-btn loot-btn" title="Lootboxes & Boosts">
+        <span class="ico">🎁</span><span class="btn-label">Boosts</span><span id="lootBadge" class="loot-count hidden">0</span>
+      </button>
+      <button id="btnProfile" class="icon-btn" title="Pseudo / Compte Authentik">
         <span class="ico">👤</span><span id="nickLabel" class="btn-label">Pseudo</span>
       </button>
       <button id="btnStats" class="icon-btn" title="Classement & Statistiques">
@@ -45,7 +49,7 @@
       <button id="btnOverlay" class="icon-btn" title="Calque modèle (guide pixel art)">
         <span class="ico">🖼️</span><span class="btn-label">Modèle</span>
       </button>
-      <button id="btnAdmin" class="icon-btn" title="Administration en direct">
+      <button id="btnAdmin" class="icon-btn hidden" title="Administration en direct">
         <span class="ico">⚙️</span><span class="btn-label">Admin</span>
       </button>
     </div>
@@ -67,13 +71,15 @@
     <div class="tool-group glass">
       <button id="btnGrid" class="tool-btn active" title="Afficher/masquer la grille (G)">#</button>
       <button id="btnEyedropper" class="tool-btn" title="Pipette (I ou clic droit)">💧</button>
+      <button id="btnDragPaint" class="tool-btn" title="Peindre en glissant (Click & Drag, D)">🖌️</button>
       <button id="btnDirectMode" class="tool-btn" title="Mode pose directe au clic">⚡</button>
       <button id="btnSound" class="tool-btn" title="Activer/couper le son">🔇</button>
     </div>
-    <!-- Admin Brush quick bar (only visible when logged in as admin) -->
+    <!-- Admin Brush quick bar (only visible to admins) -->
     <div id="adminQuickBar" class="tool-group glass admin-bar hidden">
       <button id="btnAdminBypass" class="tool-btn" title="Bypass cooldown Admin">👑</button>
-      <button id="btnBrushSize" class="tool-btn" title="Taille pinceau Admin">1×</button>
+      <button id="btnBrushSize" class="tool-btn" title="Taille pinceau large (1× à 9×)">1×</button>
+      <button id="btnBrushShape" class="tool-btn" title="Forme du pinceau (Carré / Rond)">■</button>
     </div>
   </aside>
 
@@ -82,6 +88,11 @@
 
   <!-- Bottom Control Dock -->
   <footer class="hud-bottom">
+    <!-- Active Boost Pill -->
+    <div id="activeBoostBar" class="active-boost glass hidden">
+      <span id="activeBoostText"></span>
+    </div>
+
     <!-- Coordinates & Pixel Inspector -->
     <div id="pixelInfoBar" class="pixel-info glass">
       <span id="coordText" class="mono">(0, 0)</span>
@@ -106,6 +117,30 @@
     </div>
   </footer>
 
+  <!-- MODAL: Lootbox & Inventory -->
+  <div id="modalLootbox" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card glass">
+      <div class="modal-header">
+        <h2>🎁 Lootboxes & Boosts</h2>
+        <button class="close-btn" data-close="modalLootbox">✕</button>
+      </div>
+      <div class="modal-body">
+        <p id="nextDropInfo" class="muted small"></p>
+        <div class="lootbox-hero">
+          <div id="lootChestAnim" class="loot-chest">🎁</div>
+          <div>
+            <strong id="lootboxCountLabel">0 Lootbox en stock</strong>
+            <p class="muted small" style="margin:4px 0 0">Une lootbox est offerte automatiquement à un joueur connecté au hasard !</p>
+          </div>
+          <button id="btnOpenLootbox" class="btn btn-primary" disabled>Ouvrir !</button>
+        </div>
+        <div id="lootRevealBox" class="loot-reveal hidden"></div>
+        <h3>Mes boosts disponibles</h3>
+        <div id="inventoryList" class="inventory-grid"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL: Nickname / Faction -->
   <div id="modalProfile" class="modal hidden" role="dialog" aria-modal="true">
     <div class="modal-card glass">
@@ -114,10 +149,10 @@
         <button class="close-btn" data-close="modalProfile">✕</button>
       </div>
       <div class="modal-body">
-        <p class="muted">Votre pseudo (et tag de groupe optionnel, ex: <code>[BDE] Alex</code>) s'affiche sur les pixels que vous posez et dans le classement.</p>
+        <p id="authentikIdentityInfo" class="muted small"></p>
         <label class="field">
-          <span>Pseudo / Tag (24 car. max)</span>
-          <input id="inputNickname" type="text" maxlength="24" placeholder="ex: [INFO] Camille" autocomplete="nickname" />
+          <span>Pseudo / Tag affiché (24 car. max)</span>
+          <input id="inputNickname" type="text" maxlength="24" placeholder="ex: [BDE] Camille" autocomplete="nickname" />
         </label>
         <div class="modal-footer">
           <button id="btnSaveProfile" class="btn btn-primary">Enregistrer</button>
@@ -184,6 +219,7 @@
         <button class="close-btn" data-close="modalTimelapse">✕</button>
       </div>
       <div class="modal-body">
+        <p id="tlStartInfo" class="muted small"></p>
         <div class="timelapse-stage">
           <canvas id="timelapseCanvas"></canvas>
         </div>
@@ -221,22 +257,10 @@
           <input id="inputOverlayFile" type="file" accept="image/*" />
         </label>
         <div class="grid-2">
-          <label class="field">
-            <span>Position X</span>
-            <input id="inputOverlayX" type="number" value="0" />
-          </label>
-          <label class="field">
-            <span>Position Y</span>
-            <input id="inputOverlayY" type="number" value="0" />
-          </label>
-          <label class="field">
-            <span>Largeur (pixels)</span>
-            <input id="inputOverlayW" type="number" min="1" max="1000" value="32" />
-          </label>
-          <label class="field">
-            <span>Opacité (<span id="overlayOpacityVal">50%</span>)</span>
-            <input id="inputOverlayOpacity" type="range" min="5" max="95" value="50" />
-          </label>
+          <label class="field"><span>Position X</span><input id="inputOverlayX" type="number" value="0" /></label>
+          <label class="field"><span>Position Y</span><input id="inputOverlayY" type="number" value="0" /></label>
+          <label class="field"><span>Largeur (pixels)</span><input id="inputOverlayW" type="number" min="1" max="1000" value="32" /></label>
+          <label class="field"><span>Opacité (<span id="overlayOpacityVal">50%</span>)</span><input id="inputOverlayOpacity" type="range" min="5" max="95" value="50" /></label>
         </div>
         <div class="btn-row">
           <button id="btnToggleOverlay" class="btn btn-primary">Afficher / Masquer</button>
@@ -254,9 +278,8 @@
         <button class="close-btn" data-close="modalAdmin">✕</button>
       </div>
       <div class="modal-body">
-        <!-- Admin Login View -->
-        <div id="adminLoginView">
-          <p class="muted">Connectez-vous avec le mot de passe <code>ADMIN_PASSWORD</code> configuré dans Coolify pour modifier la Pixel War en direct.</p>
+        <div id="adminLoginView" class="hidden">
+          <p class="muted">Connexion mot de passe de secours (si activé).</p>
           <form id="adminLoginForm" class="stack">
             <label class="field">
               <span>Mot de passe administrateur</span>
@@ -267,17 +290,38 @@
           </form>
         </div>
 
-        <!-- Admin Controls View -->
         <div id="adminPanelView" class="hidden">
           <div class="tabs">
-            <button class="tab-btn active" data-tab="tabRules">⏱ Règles & Cooldown</button>
+            <button class="tab-btn active" data-tab="tabRules">⏱ Règles & Début</button>
             <button class="tab-btn" data-tab="tabCanvas">🎨 Canvas & Palette</button>
-            <button class="tab-btn" data-tab="tabSnapshots">📸 Snapshots & Import</button>
+            <button class="tab-btn" data-tab="tabSnapshots">📸 Snapshots</button>
+            <button class="tab-btn" data-tab="tabLoot">🎁 Lootboxes</button>
+            <button class="tab-btn" data-tab="tabAdmins">👑 Admins</button>
             <button class="tab-btn" data-tab="tabMod">🛡️ Modération</button>
           </div>
 
-          <!-- TAB 1: Rules & Cooldown -->
+          <!-- TAB 1: Rules, Start Time & Cooldown -->
           <div id="tabRules" class="tab-pane active">
+            <div class="card-section">
+              <h3>🚀 Début de la Pixel War & Enregistrement Replay</h3>
+              <p class="muted small">Choisissez à partir de quel moment les pixels posés sont enregistrés pour le Replay/Timelapse (pratique pour préparer le canvas avant le top départ).</p>
+              <div class="grid-2">
+                <label class="field">
+                  <span>Date & heure de début (enregistrement replay)</span>
+                  <input id="admStartTime" type="datetime-local" />
+                </label>
+                <label class="field">
+                  <span>Fin automatique (gel auto du canvas)</span>
+                  <input id="admEndTime" type="datetime-local" />
+                </label>
+              </div>
+              <div class="btn-row">
+                <button id="btnAdmStartNow" class="btn btn-primary">🚀 Top départ maintenant (capturer début replay)</button>
+                <button id="btnAdmClearStartTime" class="btn btn-secondary">Retirer début</button>
+                <button id="btnAdmClearEndTime" class="btn btn-secondary">Retirer fin</button>
+              </div>
+            </div>
+
             <div class="card-section">
               <h3>⏱ Cooldown & Charges (appliqué instantanément)</h3>
               <div class="preset-chips">
@@ -291,42 +335,28 @@
                 <button type="button" class="chip" data-cd="300000">5 min</button>
               </div>
               <div class="grid-3">
+                <label class="field"><span>Cooldown (secondes)</span><input id="admCooldownSec" type="number" min="0" max="3600" step="0.5" /></label>
+                <label class="field"><span>Charges empilables (1-25)</span><input id="admMaxCharges" type="number" min="1" max="25" /></label>
                 <label class="field">
-                  <span>Cooldown (secondes)</span>
-                  <input id="admCooldownSec" type="number" min="0" max="3600" step="0.5" />
-                </label>
-                <label class="field">
-                  <span>Charges empilables (1-25)</span>
-                  <input id="admMaxCharges" type="number" min="1" max="25" />
-                </label>
-                <label class="field">
-                  <span>Mode d'identification (sans limite IP)</span>
+                  <span>Mode d'identification</span>
                   <select id="admCooldownMode">
-                    <option value="client">Session navigateur signée (Public / MINITEL)</option>
-                    <option value="authentik">Compte Authentik (si forward-auth actif)</option>
+                    <option value="authentik">Compte Authentik (Recommandé)</option>
+                    <option value="client">Session navigateur signée</option>
                   </select>
                 </label>
               </div>
             </div>
 
             <div class="card-section">
-              <h3>📣 Événement, Pause & Compte à rebours</h3>
+              <h3>📣 Événement, Pause & Options</h3>
               <div class="grid-2">
-                <label class="field">
-                  <span>Titre de l'événement</span>
-                  <input id="admTitle" type="text" maxlength="80" />
-                </label>
-                <label class="field">
-                  <span>Fin automatique (gel auto du canvas)</span>
-                  <input id="admEndTime" type="datetime-local" />
-                </label>
+                <label class="field"><span>Titre de l'événement</span><input id="admTitle" type="text" maxlength="80" /></label>
+                <label class="field"><span>Bannière d'annonce live</span><input id="admAnnouncement" type="text" maxlength="240" placeholder="Vide pour masquer" /></label>
               </div>
-              <label class="field">
-                <span>Bannière d'annonce en direct (vide pour masquer)</span>
-                <input id="admAnnouncement" type="text" maxlength="240" placeholder="Ex: 🔥 COOLDOWN À 1 SECONDE POUR LES 5 DERNIÈRES MINUTES !" />
-              </label>
               <div class="toggles-grid">
                 <label class="toggle"><input id="admPaused" type="checkbox" /><span>⏸ Figer le canvas (Pause)</span></label>
+                <label class="toggle"><input id="admLockBeforeStart" type="checkbox" /><span>⏳ Bloquer avant le début</span></label>
+                <label class="toggle"><input id="admLockNick" type="checkbox" /><span>🔒 Forcer le pseudo Authentik</span></label>
                 <label class="toggle"><input id="admRequireNick" type="checkbox" /><span>👤 Exiger un pseudo</span></label>
                 <label class="toggle"><input id="admAllowSameColor" type="checkbox" /><span>Autoriser même couleur</span></label>
                 <label class="toggle"><input id="admAllowExport" type="checkbox" /><span>💾 Export PNG public</span></label>
@@ -334,8 +364,7 @@
               </div>
               <div class="btn-row">
                 <button id="btnAdmSaveRules" class="btn btn-primary">✅ Appliquer en direct</button>
-                <button id="btnAdmClearEndTime" class="btn btn-secondary">Retirer fin auto</button>
-                <button id="btnAdmLogout" class="btn btn-danger">Déconnexion</button>
+                <button id="btnAdmLogout" class="btn btn-danger hidden">Déconnexion</button>
               </div>
             </div>
           </div>
@@ -345,14 +374,8 @@
             <div class="card-section">
               <h3>📐 Redimensionner le canvas (non-destructif)</h3>
               <div class="grid-3">
-                <label class="field">
-                  <span>Largeur (16–1000)</span>
-                  <input id="admWidth" type="number" min="16" max="1000" />
-                </label>
-                <label class="field">
-                  <span>Hauteur (16–1000)</span>
-                  <input id="admHeight" type="number" min="16" max="1000" />
-                </label>
+                <label class="field"><span>Largeur (16–1000)</span><input id="admWidth" type="number" min="16" max="1000" /></label>
+                <label class="field"><span>Hauteur (16–1000)</span><input id="admHeight" type="number" min="16" max="1000" /></label>
                 <label class="field">
                   <span>Ancrage du contenu</span>
                   <select id="admAnchor">
@@ -388,32 +411,32 @@
           <!-- TAB 3: Snapshots & Image Import -->
           <div id="tabSnapshots" class="tab-pane">
             <div class="card-section">
-              <h3>📸 Sauvegardes serveur (Snapshots)</h3>
-              <div class="grid-2">
-                <label class="field">
-                  <span>Auto-snapshot toutes les X minutes (0 = désactivé)</span>
-                  <input id="admAutoSnapMin" type="number" min="0" max="1440" />
-                </label>
-                <label class="field">
-                  <span>Nom du snapshot manuel</span>
-                  <input id="admSnapLabel" type="text" placeholder="ex: mi-temps, final" />
-                </label>
+              <h3>📸 Fréquence des auto-snapshots & Sauvegardes</h3>
+              <p id="snapScheduleInfo" class="muted small"></p>
+              <div class="preset-chips">
+                <button type="button" class="chip" data-snap-min="0">Désactivé</button>
+                <button type="button" class="chip" data-snap-min="5">5 min</button>
+                <button type="button" class="chip" data-snap-min="15">15 min</button>
+                <button type="button" class="chip" data-snap-min="30">30 min</button>
+                <button type="button" class="chip" data-snap-min="60">1 heure</button>
+                <button type="button" class="chip" data-snap-min="120">2 heures</button>
+              </div>
+              <div class="grid-3">
+                <label class="field"><span>Fréquence (minutes, 0 = off)</span><input id="admAutoSnapMin" type="number" min="0" max="1440" /></label>
+                <label class="field"><span>Max auto-snapshots gardés</span><input id="admMaxAutoSnaps" type="number" min="0" max="500" /></label>
+                <label class="field"><span>Nom snapshot manuel</span><input id="admSnapLabel" type="text" placeholder="ex: mi-temps, final" /></label>
               </div>
               <div class="btn-row">
-                <button id="btnAdmCreateSnap" class="btn btn-primary">📸 Créer un snapshot maintenant</button>
-                <button id="btnAdmSaveAutoSnap" class="btn btn-secondary">Enregistrer l'intervalle</button>
+                <button id="btnAdmSaveAutoSnap" class="btn btn-primary">✅ Appliquer fréquence</button>
+                <button id="btnAdmCreateSnap" class="btn btn-secondary">📸 Snapshot maintenant</button>
               </div>
               <div id="snapshotsList" class="snapshots-list"></div>
             </div>
 
             <div class="card-section">
-              <h3>🖼️ Importer une image sur le canvas (ex: logo de l'école)</h3>
-              <p class="muted small">L'image est automatiquement convertie dans la palette active et dessinée sur le canvas.</p>
+              <h3>🖼️ Importer une image sur le canvas</h3>
               <div class="grid-3">
-                <label class="field">
-                  <span>Fichier image</span>
-                  <input id="admImportFile" type="file" accept="image/*" />
-                </label>
+                <label class="field"><span>Fichier image</span><input id="admImportFile" type="file" accept="image/*" /></label>
                 <label class="field">
                   <span>Position X / Y</span>
                   <div class="inline-pair">
@@ -421,22 +444,70 @@
                     <input id="admImportY" type="number" value="0" placeholder="Y" />
                   </div>
                 </label>
-                <label class="field">
-                  <span>Largeur cible (px)</span>
-                  <input id="admImportW" type="number" value="48" min="4" max="500" />
-                </label>
+                <label class="field"><span>Largeur cible (px)</span><input id="admImportW" type="number" value="48" min="4" max="500" /></label>
               </div>
               <button id="btnAdmImportImg" class="btn btn-primary">Dessiner l'image sur le canvas</button>
             </div>
           </div>
 
-          <!-- TAB 4: Moderation -->
+          <!-- TAB 4: Lootboxes -->
+          <div id="tabLoot" class="tab-pane">
+            <div class="card-section">
+              <h3>🎁 Système de Lootboxes aléatoires</h3>
+              <p class="muted small">Attribue automatiquement une lootbox à un joueur connecté au hasard (1 chance par compte Authentik, même avec plusieurs onglets).</p>
+              <div class="preset-chips">
+                <button type="button" class="chip" data-loot-min="1">1 min (Test)</button>
+                <button type="button" class="chip" data-loot-min="15">15 min</button>
+                <button type="button" class="chip" data-loot-min="30">30 min</button>
+                <button type="button" class="chip" data-loot-min="60">1 heure (Défaut)</button>
+                <button type="button" class="chip" data-loot-min="120">2 heures</button>
+              </div>
+              <div class="grid-2">
+                <label class="toggle"><input id="admLootEnabled" type="checkbox" /><span>🎁 Activer les drops automatiques</span></label>
+                <label class="field"><span>Intervalle entre drops (minutes)</span><input id="admLootInterval" type="number" min="1" max="1440" /></label>
+              </div>
+              <div class="btn-row">
+                <button id="btnAdmSaveLoot" class="btn btn-primary">✅ Enregistrer réglages Lootbox</button>
+                <button id="btnAdmDropRandom" class="btn btn-secondary">🎲 Envoyer 1 lootbox aléatoire maintenant</button>
+              </div>
+            </div>
+            <div class="card-section">
+              <h3>🎯 Offrir une lootbox à un joueur précis</h3>
+              <div class="btn-row">
+                <input id="admLootTargetInput" type="text" placeholder="Identifiant Authentik (ex: camille)" />
+                <button id="btnAdmDropTarget" class="btn btn-primary">🎁 Envoyer</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- TAB 5: Admin Users Management -->
+          <div id="tabAdmins" class="tab-pane">
+            <div class="card-section">
+              <h3>👑 Gestion des administrateurs</h3>
+              <p class="muted small">Ajoutez ou retirez des utilisateurs Authentik (par leur identifiant <code>username</code>) en tant qu'administrateurs. Le changement s'applique en temps réel.</p>
+              <div class="btn-row">
+                <input id="admAddAdminInput" type="text" placeholder="Identifiant Authentik (ex: camille.dupont)" />
+                <button id="btnAdmAddAdmin" class="btn btn-primary">+ Ajouter admin</button>
+                <button id="btnAdmRefreshAdmins" class="btn btn-secondary">↻ Actualiser</button>
+              </div>
+              <h4>Groupes Authentik admins (env <code>AUTHENTIK_ADMIN_GROUPS</code>)</h4>
+              <div id="admGroupsList" class="preset-chips"></div>
+              <h4>Admins fixes (env <code>ADMIN_USERS</code>)</h4>
+              <div id="admEnvUsersList" class="preset-chips"></div>
+              <h4>Admins ajoutés dynamiquement</h4>
+              <div id="admDynamicList" class="bans-list"></div>
+              <h4>Utilisateurs Authentik connectés</h4>
+              <div id="admConnectedUsersList" class="bans-list"></div>
+            </div>
+          </div>
+
+          <!-- TAB 6: Moderation -->
           <div id="tabMod" class="tab-pane">
             <div class="card-section">
               <h3>🛡️ Joueurs connectés & Restrictions</h3>
-              <p class="muted small">Sur l'infra MINITEL, tous les visiteurs partagent l'IP du VPS : les restrictions s'appliquent par session navigateur, compte Authentik (<code>ak:&lt;uid&gt;</code>) ou pseudo (<code>nick:&lt;pseudo&gt;</code>).</p>
+              <p class="muted small">Sur l'infra MINITEL, tous les visiteurs partagent l'IP du VPS : les restrictions s'appliquent par compte Authentik (<code>ak:&lt;uid&gt;</code>), session ou pseudo (<code>nick:&lt;pseudo&gt;</code>).</p>
               <div class="btn-row">
-                <input id="admBanInput" type="text" placeholder="Session ID, ak:<uid> ou nick:<pseudo>" />
+                <input id="admBanInput" type="text" placeholder="ak:<uid> ou nick:<pseudo>" />
                 <button id="btnAdmBan" class="btn btn-danger">Restreindre</button>
                 <button id="btnAdmRefreshBans" class="btn btn-secondary">↻ Actualiser</button>
               </div>

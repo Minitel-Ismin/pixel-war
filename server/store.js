@@ -46,6 +46,65 @@ const PALETTE_PRESETS = {
   },
 };
 
+const LOOTBOX_ITEMS = {
+  frenzy: {
+    id: 'frenzy',
+    name: 'Frénésie Illimitée',
+    icon: '⚡',
+    rarity: 'Épique',
+    weight: 20,
+    durationMs: 5000,
+    description: 'Cooldown à 0 pendant 5 secondes ! Peins à toute vitesse (et en glissant) !',
+  },
+  bomb: {
+    id: 'bomb',
+    name: 'Bombe de Peinture',
+    icon: '💣',
+    rarity: 'Épique',
+    weight: 22,
+    radius: 4,
+    description: 'Ton prochain pixel déclenche un éclat organique de ta couleur (rayon 4 px) !',
+  },
+  brush3: {
+    id: 'brush3',
+    name: 'Pinceau Large 3×3',
+    icon: '🖌️',
+    rarity: 'Rare',
+    weight: 22,
+    uses: 3,
+    description: 'Tes 3 prochaines poses peignent un carré de 3×3 pixels d\'un coup !',
+  },
+  shield: {
+    id: 'shield',
+    name: 'Bouclier de Zone 5×5',
+    icon: '🛡️',
+    rarity: 'Rare',
+    weight: 16,
+    radius: 2,
+    durationMs: 120_000,
+    description: 'Protège une zone 5×5 autour de ton prochain pixel pendant 2 minutes !',
+  },
+  charges5: {
+    id: 'charges5',
+    name: 'Pack +5 Pixels',
+    icon: '🔋',
+    rarity: 'Commun',
+    weight: 25,
+    charges: 5,
+    description: 'Ajoute instantanément 5 pixels bonus prêts à poser sans attendre !',
+  },
+  rainbow: {
+    id: 'rainbow',
+    name: 'Pinceau Arc-en-Ciel',
+    icon: '🌈',
+    rarity: 'Fun',
+    weight: 18,
+    durationMs: 5000,
+    cooldownMs: 350,
+    description: 'Pose ultra-rapide (0,35s) pendant 5s avec dégradé arc-en-ciel automatique !',
+  },
+};
+
 const HEX_RE = /^#[0-9A-Fa-f]{6}$/;
 
 class PixelWarStore {
@@ -58,44 +117,57 @@ class PixelWarStore {
     this.canvasPath = path.join(this.dataDir, 'canvas.bin');
     this.metaPath = path.join(this.dataDir, 'meta.json');
     this.historyPath = path.join(this.dataDir, 'history.ndjson');
+    this.baselinePath = path.join(this.dataDir, 'replay-baseline.bin');
 
     // Default dynamic configuration
     this.config = {
-      title: process.env.EVENT_TITLE || 'Pixel War de la Promo',
+      title: process.env.EVENT_TITLE || 'Pixel War ISMIN',
       subtitle: process.env.EVENT_SUBTITLE || 'Pose ton pixel, défends ta faction !',
       width: clampInt(parseInt(process.env.CANVAS_WIDTH || '128', 10), 16, 1000),
       height: clampInt(parseInt(process.env.CANVAS_HEIGHT || '128', 10), 16, 1000),
       cooldownMs: clampInt(parseInt(process.env.COOLDOWN_MS || '5000', 10), 0, 3600000),
       maxCharges: clampInt(parseInt(process.env.MAX_CHARGES || '1', 10), 1, 25),
-      cooldownMode: validateCooldownMode(process.env.COOLDOWN_MODE || 'client'),
+      cooldownMode: validateCooldownMode(process.env.COOLDOWN_MODE || 'authentik'),
       paused: false,
       allowSameColor: false,
       allowPublicExport: true,
       allowTimelapse: true,
       requireNickname: false,
+      lockNicknameToAuthentik: false,
       announcement: '',
+      startTime: null, // ISO timestamp: replay recording begins at startTime
+      lockBeforeStart: false, // if true, non-admin players cannot draw before startTime
       endTime: null, // ISO timestamp or null
       autoSnapshotMinutes: clampInt(parseInt(process.env.AUTO_SNAPSHOT_MINUTES || '15', 10), 0, 1440),
+      maxAutoSnapshots: clampInt(parseInt(process.env.MAX_AUTO_SNAPSHOTS || '48', 10), 0, 500),
+      lootboxEnabled: process.env.LOOTBOX_ENABLED !== 'false',
+      lootboxIntervalMinutes: clampInt(parseInt(process.env.LOOTBOX_INTERVAL_MINUTES || '60', 10), 1, 1440),
       palette: [...PALETTE_PRESETS.rplace32.colors],
     };
 
     // Runtime state
     this.pixels = new Uint8Array(this.config.width * this.config.height);
-    this.pixelTimestamps = new Uint32Array(this.config.width * this.config.height); // seconds since epoch
-    this.pixelAuthors = new Uint16Array(this.config.width * this.config.height); // index into authorList (0 = none)
+    this.pixelTimestamps = new Uint32Array(this.config.width * this.config.height);
+    this.pixelAuthors = new Uint16Array(this.config.width * this.config.height);
     this.authorList = [''];
     this.authorIndexMap = new Map([['', 0]]);
-    this.authorCounts = new Map(); // nickname -> total pixels placed
+    this.authorCounts = new Map();
     this.totalPixelsPlaced = 0;
 
-    // Cooldown tracking: key -> { charges: number, lastRefill: number }
-    this.cooldownBuckets = new Map();
-    // Per-session anti-flood guard (never by IP: all MINITEL traffic shares VPS IP)
-    this.sessionFloodGuard = new Map();
-    // Banned keys (clientIds, authentik UIDs, or nicknames)
-    this.bannedSet = new Set();
+    // Replay baseline metadata
+    this.replayBaselineMeta = null; // { capturedAt, width, height }
 
-    // History in memory (ring buffer / full list up to 250k events for fast timelapse API)
+    // Cooldown tracking
+    this.cooldownBuckets = new Map();
+    this.sessionFloodGuard = new Map();
+    this.bannedSet = new Set();
+    this.extraAdmins = new Set();
+
+    // Lootboxes & Boosts
+    this.inventories = new Map(); // userKey -> { lootboxes, items, activeBoost, bonusCharges }
+    this.shields = []; // [{ id, x, y, radius, ownerKey, ownerName, expiresAt }]
+    this.nextAutoSnapshotAt = null;
+
     this.historyCount = 0;
     this._dirty = false;
     this._saveTimer = null;
@@ -117,7 +189,10 @@ class PixelWarStore {
             height: clampInt(saved.config.height, 16, 1000),
             cooldownMs: clampInt(saved.config.cooldownMs, 0, 3600000),
             maxCharges: clampInt(saved.config.maxCharges || 1, 1, 25),
-            cooldownMode: validateCooldownMode(saved.config.cooldownMode || 'client'),
+            cooldownMode: validateCooldownMode(saved.config.cooldownMode || 'authentik'),
+            autoSnapshotMinutes: clampInt(saved.config.autoSnapshotMinutes ?? 15, 0, 1440),
+            maxAutoSnapshots: clampInt(saved.config.maxAutoSnapshots ?? 48, 0, 500),
+            lootboxIntervalMinutes: clampInt(saved.config.lootboxIntervalMinutes ?? 60, 1, 1440),
           };
           if (!Array.isArray(this.config.palette) || this.config.palette.length < 2) {
             this.config.palette = [...PALETTE_PRESETS.rplace32.colors];
@@ -129,10 +204,25 @@ class PixelWarStore {
         if (Array.isArray(saved.banned)) {
           this.bannedSet = new Set(saved.banned);
         }
+        if (Array.isArray(saved.extraAdmins)) {
+          this.extraAdmins = new Set(saved.extraAdmins.map((u) => normalizeUsername(u)).filter(Boolean));
+        }
         if (saved.authorCounts && typeof saved.authorCounts === 'object') {
           for (const [k, v] of Object.entries(saved.authorCounts)) {
             this.authorCounts.set(k, v);
           }
+        }
+        if (saved.replayBaselineMeta) {
+          this.replayBaselineMeta = saved.replayBaselineMeta;
+        }
+        if (saved.inventories && typeof saved.inventories === 'object') {
+          for (const [k, inv] of Object.entries(saved.inventories)) {
+            this.inventories.set(k, normalizeInventory(inv));
+          }
+        }
+        if (Array.isArray(saved.shields)) {
+          const now = Date.now();
+          this.shields = saved.shields.filter((s) => s && s.expiresAt > now);
         }
       }
 
@@ -199,11 +289,16 @@ class PixelWarStore {
       fs.writeFileSync(tmpCanvas, Buffer.from(this.pixels.buffer, this.pixels.byteOffset, this.pixels.byteLength));
       fs.renameSync(tmpCanvas, this.canvasPath);
 
+      this.pruneExpiredShields();
       const stateObj = {
         config: this.config,
         totalPixelsPlaced: this.totalPixelsPlaced,
         banned: Array.from(this.bannedSet),
+        extraAdmins: Array.from(this.extraAdmins),
         authorCounts: Object.fromEntries(this.authorCounts),
+        replayBaselineMeta: this.replayBaselineMeta,
+        inventories: Object.fromEntries(this.inventories),
+        shields: this.shields,
         savedAt: new Date().toISOString(),
       };
       const tmpState = this.statePath + '.tmp';
@@ -230,17 +325,34 @@ class PixelWarStore {
       this._snapshotTimer = null;
     }
     const mins = this.config.autoSnapshotMinutes;
-    if (!mins || mins <= 0) return;
+    if (!mins || mins <= 0) {
+      this.nextAutoSnapshotAt = null;
+      return;
+    }
+    const intervalMs = mins * 60 * 1000;
+    this.nextAutoSnapshotAt = Date.now() + intervalMs;
     this._snapshotTimer = setInterval(() => {
+      this.nextAutoSnapshotAt = Date.now() + intervalMs;
       if (this.totalPixelsPlaced > 0) {
         try {
           this.createSnapshot('auto');
+          this._pruneAutoSnapshots();
         } catch (err) {
           console.error('[Snapshot] Erreur auto-snapshot:', err.message);
         }
       }
-    }, mins * 60 * 1000);
+    }, intervalMs);
     this._snapshotTimer.unref();
+  }
+
+  _pruneAutoSnapshots() {
+    const max = this.config.maxAutoSnapshots;
+    if (!max || max <= 0) return;
+    const autos = this.listSnapshots().filter((s) => s.label === 'auto');
+    if (autos.length <= max) return;
+    for (const old of autos.slice(max)) {
+      this.deleteSnapshot(old.id);
+    }
   }
 
   _getAuthorIndex(nickname) {
@@ -248,17 +360,64 @@ class PixelWarStore {
     if (!clean) return 0;
     let idx = this.authorIndexMap.get(clean);
     if (idx !== undefined) return idx;
-    if (this.authorList.length >= 65530) {
-      // Fallback if >65k unique nicknames
-      return 0;
-    }
+    if (this.authorList.length >= 65530) return 0;
     idx = this.authorList.length;
     this.authorList.push(clean);
     this.authorIndexMap.set(clean, idx);
     return idx;
   }
 
+  isBeforeStart(now = Date.now()) {
+    if (!this.config.startTime) return false;
+    const ms = Date.parse(this.config.startTime);
+    return !Number.isNaN(ms) && now < ms;
+  }
+
+  isReplayRecordingActive(now = Date.now()) {
+    if (!this.config.startTime) return true;
+    const ms = Date.parse(this.config.startTime);
+    return Number.isNaN(ms) || now >= ms;
+  }
+
+  isEffectivelyPaused(now = Date.now()) {
+    if (this.config.paused) return true;
+    if (this.config.lockBeforeStart && this.isBeforeStart(now)) return true;
+    if (this.config.endTime) {
+      const endMs = Date.parse(this.config.endTime);
+      if (!Number.isNaN(endMs) && now >= endMs) return true;
+    }
+    return false;
+  }
+
+  captureReplayBaseline(resetHistoryBeforeNow = true) {
+    const now = Date.now();
+    const tmp = this.baselinePath + '.tmp';
+    fs.writeFileSync(tmp, Buffer.from(this.pixels.buffer, this.pixels.byteOffset, this.pixels.byteLength));
+    fs.renameSync(tmp, this.baselinePath);
+    this.replayBaselineMeta = {
+      capturedAt: new Date(now).toISOString(),
+      width: this.config.width,
+      height: this.config.height,
+    };
+    if (resetHistoryBeforeNow) {
+      try {
+        fs.writeFileSync(this.historyPath, '');
+        this.historyCount = 0;
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      this.createSnapshot('debut-evenement');
+    } catch {
+      // ignore
+    }
+    this.scheduleSave();
+    return this.replayBaselineMeta;
+  }
+
   getPublicConfig() {
+    const now = Date.now();
     return {
       title: this.config.title,
       subtitle: this.config.subtitle,
@@ -267,31 +426,162 @@ class PixelWarStore {
       cooldownMs: this.config.cooldownMs,
       maxCharges: this.config.maxCharges,
       cooldownMode: this.config.cooldownMode,
-      paused: this.isEffectivelyPaused(),
+      paused: this.isEffectivelyPaused(now),
       manualPaused: this.config.paused,
+      beforeStart: this.isBeforeStart(now),
+      replayRecording: this.isReplayRecordingActive(now),
       allowSameColor: this.config.allowSameColor,
       allowPublicExport: this.config.allowPublicExport,
       allowTimelapse: this.config.allowTimelapse,
       requireNickname: this.config.requireNickname,
+      lockNicknameToAuthentik: this.config.lockNicknameToAuthentik,
       announcement: this.config.announcement,
+      startTime: this.config.startTime,
+      lockBeforeStart: this.config.lockBeforeStart,
       endTime: this.config.endTime,
       autoSnapshotMinutes: this.config.autoSnapshotMinutes,
+      maxAutoSnapshots: this.config.maxAutoSnapshots,
+      nextAutoSnapshotAt: this.nextAutoSnapshotAt,
+      lootboxEnabled: this.config.lootboxEnabled,
+      lootboxIntervalMinutes: this.config.lootboxIntervalMinutes,
       palette: this.config.palette,
       totalPixelsPlaced: this.totalPixelsPlaced,
     };
   }
 
-  isEffectivelyPaused() {
-    if (this.config.paused) return true;
-    if (this.config.endTime) {
-      const endMs = Date.parse(this.config.endTime);
-      if (!Number.isNaN(endMs) && Date.now() >= endMs) {
-        return true;
-      }
-    }
-    return false;
+  // ─────────────────────────── Lootboxes, Inventory & Shields ───────────────────────────
+  getUserKey(clientId, authentikUid = '') {
+    return authentikUid ? `ak:${authentikUid}` : `cid:${clientId}`;
   }
 
+  getInventory(userKey) {
+    let inv = this.inventories.get(userKey);
+    if (!inv) {
+      inv = normalizeInventory(null);
+      this.inventories.set(userKey, inv);
+    }
+    this._cleanupActiveBoost(inv);
+    return {
+      lootboxes: inv.lootboxes,
+      items: { ...inv.items },
+      activeBoost: inv.activeBoost ? { ...inv.activeBoost } : null,
+      bonusCharges: inv.bonusCharges,
+    };
+  }
+
+  _cleanupActiveBoost(inv, now = Date.now()) {
+    if (!inv.activeBoost) return;
+    if (inv.activeBoost.expiresAt && now >= inv.activeBoost.expiresAt) {
+      inv.activeBoost = null;
+    } else if (typeof inv.activeBoost.remainingUses === 'number' && inv.activeBoost.remainingUses <= 0) {
+      inv.activeBoost = null;
+    }
+  }
+
+  grantLootbox(userKey, count = 1) {
+    let inv = this.inventories.get(userKey);
+    if (!inv) {
+      inv = normalizeInventory(null);
+      this.inventories.set(userKey, inv);
+    }
+    inv.lootboxes += Math.max(1, Math.min(10, count | 0));
+    this.scheduleSave();
+    return this.getInventory(userKey);
+  }
+
+  openLootbox(userKey) {
+    const inv = this.inventories.get(userKey);
+    if (!inv || inv.lootboxes <= 0) {
+      throw new Error('Vous n\'avez aucune lootbox à ouvrir.');
+    }
+    inv.lootboxes--;
+
+    // Weighted random draw
+    const pool = Object.values(LOOTBOX_ITEMS);
+    const totalWeight = pool.reduce((sum, it) => sum + it.weight, 0);
+    let roll = crypto.randomInt(0, totalWeight);
+    let picked = pool[0];
+    for (const item of pool) {
+      if (roll < item.weight) {
+        picked = item;
+        break;
+      }
+      roll -= item.weight;
+    }
+
+    inv.items[picked.id] = (inv.items[picked.id] || 0) + 1;
+    this.scheduleSave();
+    return { item: picked, inventory: this.getInventory(userKey) };
+  }
+
+  activateBoost(userKey, itemId) {
+    const def = LOOTBOX_ITEMS[itemId];
+    if (!def) throw new Error('Objet inconnu.');
+    const inv = this.inventories.get(userKey);
+    if (!inv || (inv.items[itemId] || 0) <= 0) {
+      throw new Error('Vous ne possédez pas cet objet.');
+    }
+    const now = Date.now();
+    this._cleanupActiveBoost(inv, now);
+
+    if (itemId === 'charges5') {
+      inv.items[itemId]--;
+      inv.bonusCharges = Math.min(50, (inv.bonusCharges || 0) + def.charges);
+      this.scheduleSave();
+      return { item: def, inventory: this.getInventory(userKey) };
+    }
+
+    if (inv.activeBoost) {
+      throw new Error(`Un boost (${LOOTBOX_ITEMS[inv.activeBoost.type]?.name || inv.activeBoost.type}) est déjà actif !`);
+    }
+
+    inv.items[itemId]--;
+    if (itemId === 'frenzy') {
+      inv.activeBoost = { type: 'frenzy', expiresAt: now + def.durationMs };
+    } else if (itemId === 'rainbow') {
+      inv.activeBoost = { type: 'rainbow', expiresAt: now + def.durationMs, lastPlaceAt: 0, rainbowStep: 0 };
+    } else if (itemId === 'bomb') {
+      inv.activeBoost = { type: 'bomb', remainingUses: 1 };
+    } else if (itemId === 'brush3') {
+      inv.activeBoost = { type: 'brush3', remainingUses: def.uses };
+    } else if (itemId === 'shield') {
+      inv.activeBoost = { type: 'shield', remainingUses: 1 };
+    }
+
+    this.scheduleSave();
+    return { item: def, inventory: this.getInventory(userKey) };
+  }
+
+  pruneExpiredShields(now = Date.now()) {
+    const before = this.shields.length;
+    this.shields = this.shields.filter((s) => s.expiresAt > now);
+    return this.shields.length !== before;
+  }
+
+  getActiveShields(now = Date.now()) {
+    this.pruneExpiredShields(now);
+    return this.shields.map((s) => ({
+      id: s.id,
+      x: s.x,
+      y: s.y,
+      radius: s.radius,
+      ownerName: s.ownerName,
+      expiresAt: s.expiresAt,
+    }));
+  }
+
+  findBlockingShield(x, y, userKey, now = Date.now()) {
+    this.pruneExpiredShields(now);
+    for (const s of this.shields) {
+      if (s.ownerKey === userKey) continue;
+      if (Math.abs(x - s.x) <= s.radius && Math.abs(y - s.y) <= s.radius) {
+        return s;
+      }
+    }
+    return null;
+  }
+
+  // ─────────────────────────── Cooldown & Placement ───────────────────────────
   _getBucketKeys(clientId, authentikUid = '') {
     const mode = this.config.cooldownMode;
     if (mode === 'authentik' && authentikUid) {
@@ -330,10 +620,30 @@ class PixelWarStore {
 
   getCooldownStatus(clientId, authentikUid = '', isAdminBypass = false) {
     const now = Date.now();
+    const userKey = this.getUserKey(clientId, authentikUid);
+    const inv = this.inventories.get(userKey);
+    if (inv) this._cleanupActiveBoost(inv, now);
+    const bonusCharges = inv?.bonusCharges || 0;
+    const activeBoost = inv?.activeBoost || null;
+
     const maxC = this.config.maxCharges;
     const cd = this.config.cooldownMs;
-    if (isAdminBypass || cd <= 0) {
-      return { charges: maxC, maxCharges: maxC, nextRefillMs: 0, cooldownMs: cd };
+
+    if (isAdminBypass || (activeBoost && activeBoost.type === 'frenzy') || cd <= 0) {
+      return { charges: maxC, maxCharges: maxC, bonusCharges, nextRefillMs: 0, cooldownMs: 0, activeBoost };
+    }
+
+    if (activeBoost && activeBoost.type === 'rainbow') {
+      const rCd = LOOTBOX_ITEMS.rainbow.cooldownMs;
+      const wait = Math.max(0, rCd - (now - (activeBoost.lastPlaceAt || 0)));
+      return {
+        charges: wait === 0 ? 1 : 0,
+        maxCharges: 1,
+        bonusCharges,
+        nextRefillMs: wait,
+        cooldownMs: rCd,
+        activeBoost,
+      };
     }
 
     const keys = this._getBucketKeys(clientId, authentikUid);
@@ -358,14 +668,17 @@ class PixelWarStore {
     return {
       charges: minCharges,
       maxCharges: maxC,
+      bonusCharges,
       nextRefillMs: minCharges > 0 ? (minCharges < maxC ? maxWaitMs : 0) : maxWaitMs,
       cooldownMs: cd,
+      activeBoost,
     };
   }
 
   placePixel({ x, y, color, clientId, authentikUid = '', nickname = '', isAdminBypass = false }) {
     const now = Date.now();
     const cleanNick = sanitizeNickname(nickname);
+    const userKey = this.getUserKey(clientId, authentikUid);
 
     if (
       !isAdminBypass &&
@@ -377,7 +690,10 @@ class PixelWarStore {
       return { ok: false, code: 'BANNED', message: 'Vous avez été restreint par un administrateur.' };
     }
 
-    if (!isAdminBypass && this.isEffectivelyPaused()) {
+    if (!isAdminBypass && this.isEffectivelyPaused(now)) {
+      if (this.config.lockBeforeStart && this.isBeforeStart(now)) {
+        return { ok: false, code: 'NOT_STARTED', message: 'La Pixel War n\'a pas encore démarré !' };
+      }
       return { ok: false, code: 'PAUSED', message: 'Le canvas est actuellement figé.' };
     }
 
@@ -393,100 +709,234 @@ class PixelWarStore {
       return { ok: false, code: 'NICKNAME_REQUIRED', message: 'Un pseudo est requis pour poser un pixel.' };
     }
 
-    const idx = y * this.config.width + x;
-    if (!isAdminBypass && !this.config.allowSameColor && this.pixels[idx] === color) {
-      return { ok: false, code: 'SAME_COLOR', message: 'Ce pixel a déjà cette couleur.' };
-    }
+    let inv = this.inventories.get(userKey);
+    if (inv) this._cleanupActiveBoost(inv, now);
+    const activeBoost = !isAdminBypass && inv ? inv.activeBoost : null;
 
-    // Per-session anti-flood guard (max 25 req/s per session, never keyed by IP)
+    // Anti-flood per session (generous limit so Frenzy + Drag Paint works super smoothly!)
     if (!isAdminBypass) {
-      const floodKey = authentikUid ? `ak:${authentikUid}` : `cid:${clientId}`;
-      let guard = this.sessionFloodGuard.get(floodKey);
+      const limitPerSec = activeBoost?.type === 'frenzy' ? 120 : 40;
+      let guard = this.sessionFloodGuard.get(userKey);
       if (!guard || now - guard.winStart > 1000) {
         guard = { winStart: now, count: 0 };
-        this.sessionFloodGuard.set(floodKey, guard);
+        this.sessionFloodGuard.set(userKey, guard);
       }
-      if (guard.count >= 25) {
+      if (guard.count >= limitPerSec) {
         return { ok: false, code: 'RATE_LIMIT', message: 'Trop de requêtes rapides sur cette session.' };
       }
       guard.count++;
     }
 
-    // Check cooldown
-    if (!isAdminBypass && this.config.cooldownMs > 0) {
-      const status = this.getCooldownStatus(clientId, authentikUid, false);
-      if (status.charges <= 0) {
+    // ─── Special Boost: Paint Bomb (organic splatter radius 4) ───
+    if (activeBoost && activeBoost.type === 'bomb') {
+      const r = LOOTBOX_ITEMS.bomb.radius;
+      const targets = [];
+      for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+          const px = x + dx;
+          const py = y + dy;
+          if (px < 0 || px >= this.config.width || py < 0 || py >= this.config.height) continue;
+          const dist = Math.hypot(dx, dy);
+          if (dist > r + 0.3) continue;
+          // Core guaranteed + organic paint splatter outer edge
+          if (dist <= 2.2 || (dist <= r && ((Math.abs(dx * 7 + dy * 13 + x + y) + crypto.randomInt(0, 10)) % 10 < 5))) {
+            if (!this.findBlockingShield(px, py, userKey, now)) {
+              targets.push({ x: px, y: py, c: color });
+            }
+          }
+        }
+      }
+      inv.activeBoost.remainingUses--;
+      this._cleanupActiveBoost(inv, now);
+      const placed = this._commitPixels(targets, cleanNick, now);
+      return {
+        ok: true,
+        pixels: placed,
+        effect: { type: 'bomb', x, y, color, author: cleanNick },
+        cooldown: this.getCooldownStatus(clientId, authentikUid, false),
+        inventory: this.getInventory(userKey),
+        totalPixelsPlaced: this.totalPixelsPlaced,
+      };
+    }
+
+    // ─── Special Boost: 3x3 Brush ───
+    if (activeBoost && activeBoost.type === 'brush3') {
+      const targets = [];
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          const px = x + dx;
+          const py = y + dy;
+          if (px < 0 || px >= this.config.width || py < 0 || py >= this.config.height) continue;
+          if (!this.findBlockingShield(px, py, userKey, now)) {
+            targets.push({ x: px, y: py, c: color });
+          }
+        }
+      }
+      inv.activeBoost.remainingUses--;
+      this._cleanupActiveBoost(inv, now);
+      const placed = this._commitPixels(targets, cleanNick, now);
+      return {
+        ok: true,
+        pixels: placed,
+        effect: { type: 'brush3', x, y, color, author: cleanNick },
+        cooldown: this.getCooldownStatus(clientId, authentikUid, false),
+        inventory: this.getInventory(userKey),
+        totalPixelsPlaced: this.totalPixelsPlaced,
+      };
+    }
+
+    // ─── Special Boost: 5x5 Shield (2 min) ───
+    if (activeBoost && activeBoost.type === 'shield') {
+      const shieldDef = LOOTBOX_ITEMS.shield;
+      const newShield = {
+        id: crypto.randomBytes(4).toString('hex'),
+        x,
+        y,
+        radius: shieldDef.radius,
+        ownerKey: userKey,
+        ownerName: cleanNick || 'Joueur',
+        expiresAt: now + shieldDef.durationMs,
+      };
+      this.shields.push(newShield);
+      if (this.shields.length > 30) this.shields.shift();
+      inv.activeBoost.remainingUses--;
+      this._cleanupActiveBoost(inv, now);
+      const placed = this._commitPixels([{ x, y, c: color }], cleanNick, now);
+      return {
+        ok: true,
+        pixels: placed,
+        shieldsUpdated: true,
+        effect: { type: 'shield', x, y, author: cleanNick },
+        cooldown: this.getCooldownStatus(clientId, authentikUid, false),
+        inventory: this.getInventory(userKey),
+        totalPixelsPlaced: this.totalPixelsPlaced,
+      };
+    }
+
+    // Check shield protection for single pixel
+    if (!isAdminBypass) {
+      const blocker = this.findBlockingShield(x, y, userKey, now);
+      if (blocker) {
         return {
           ok: false,
-          code: 'COOLDOWN',
-          message: 'Cooldown en cours !',
-          retryAfterMs: status.nextRefillMs,
-          cooldown: status,
+          code: 'SHIELDED',
+          message: `🛡️ Zone protégée par le bouclier de ${blocker.ownerName} !`,
         };
       }
+    }
 
-      // Consume 1 charge from each tracked key
-      const keys = this._getBucketKeys(clientId, authentikUid);
-      for (const key of keys) {
-        const bucket = this.cooldownBuckets.get(key);
-        if (bucket) {
-          if (bucket.charges === this.config.maxCharges) {
-            bucket.lastRefill = now;
+    // Resolve color for Rainbow boost
+    let finalColor = color;
+    if (activeBoost && activeBoost.type === 'rainbow') {
+      const vividIndices = [];
+      for (let i = 0; i < this.config.palette.length; i++) {
+        const hex = this.config.palette[i];
+        if (!['#FFFFFF', '#000000', '#D4D7D9', '#898D90', '#515252'].includes(hex)) {
+          vividIndices.push(i);
+        }
+      }
+      const pool = vividIndices.length >= 3 ? vividIndices : this.config.palette.map((_, i) => i);
+      finalColor = pool[activeBoost.rainbowStep % pool.length];
+      activeBoost.rainbowStep++;
+    }
+
+    const idx = y * this.config.width + x;
+    if (!isAdminBypass && !this.config.allowSameColor && this.pixels[idx] === finalColor && !(activeBoost && activeBoost.type === 'frenzy')) {
+      return { ok: false, code: 'SAME_COLOR', message: 'Ce pixel a déjà cette couleur.' };
+    }
+
+    // Check & consume cooldown (skip for adminBypass or Frenzy)
+    const isFrenzy = Boolean(activeBoost && activeBoost.type === 'frenzy');
+    const isRainbow = Boolean(activeBoost && activeBoost.type === 'rainbow');
+
+    if (!isAdminBypass && !isFrenzy) {
+      if (isRainbow) {
+        const rCd = LOOTBOX_ITEMS.rainbow.cooldownMs;
+        const wait = Math.max(0, rCd - (now - (activeBoost.lastPlaceAt || 0)));
+        if (wait > 0) {
+          return {
+            ok: false,
+            code: 'COOLDOWN',
+            message: 'Arc-en-ciel en recharge...',
+            retryAfterMs: wait,
+            cooldown: this.getCooldownStatus(clientId, authentikUid, false),
+          };
+        }
+        activeBoost.lastPlaceAt = now;
+      } else if (this.config.cooldownMs > 0) {
+        const status = this.getCooldownStatus(clientId, authentikUid, false);
+        if (status.charges > 0) {
+          const keys = this._getBucketKeys(clientId, authentikUid);
+          for (const key of keys) {
+            const bucket = this.cooldownBuckets.get(key);
+            if (bucket) {
+              if (bucket.charges === this.config.maxCharges) bucket.lastRefill = now;
+              bucket.charges = Math.max(0, bucket.charges - 1);
+            }
           }
-          bucket.charges = Math.max(0, bucket.charges - 1);
+        } else if (inv && inv.bonusCharges > 0) {
+          inv.bonusCharges--;
+        } else {
+          return {
+            ok: false,
+            code: 'COOLDOWN',
+            message: 'Cooldown en cours !',
+            retryAfterMs: status.nextRefillMs,
+            cooldown: status,
+          };
         }
       }
     }
 
-    // Apply pixel
-    this.pixels[idx] = color;
-    const tsSec = Math.floor(now / 1000);
-    this.pixelTimestamps[idx] = tsSec;
-    const authorIdx = this._getAuthorIndex(cleanNick);
-    this.pixelAuthors[idx] = authorIdx;
-    this.totalPixelsPlaced++;
-
-    if (cleanNick) {
-      this.authorCounts.set(cleanNick, (this.authorCounts.get(cleanNick) || 0) + 1);
-    }
-
-    // Append to history file for timelapse
-    this._appendHistory({ t: now, x, y, c: color, a: cleanNick || undefined });
-    this.scheduleSave();
-
+    const placed = this._commitPixels([{ x, y, c: finalColor }], cleanNick, now);
     const cooldown = this.getCooldownStatus(clientId, authentikUid, isAdminBypass);
     return {
       ok: true,
-      pixel: { x, y, color, author: cleanNick, timestamp: tsSec },
+      pixel: { x, y, color: finalColor, author: cleanNick, timestamp: Math.floor(now / 1000) },
+      pixels: placed,
       cooldown,
+      inventory: inv ? this.getInventory(userKey) : null,
       totalPixelsPlaced: this.totalPixelsPlaced,
     };
   }
 
-  applyBatchPixels(updates, author = 'Admin') {
-    const now = Date.now();
+  _commitPixels(updates, author, now) {
     const tsSec = Math.floor(now / 1000);
     const authorIdx = this._getAuthorIndex(author);
     const applied = [];
 
     for (const u of updates) {
-      const x = u.x | 0;
-      const y = u.y | 0;
-      const c = u.c | 0;
-      if (x < 0 || x >= this.config.width || y < 0 || y >= this.config.height) continue;
-      if (c < 0 || c >= this.config.palette.length) continue;
-      const idx = y * this.config.width + x;
-      this.pixels[idx] = c;
+      const px = u.x | 0;
+      const py = u.y | 0;
+      const pc = u.c | 0;
+      if (px < 0 || px >= this.config.width || py < 0 || py >= this.config.height) continue;
+      if (pc < 0 || pc >= this.config.palette.length) continue;
+      const idx = py * this.config.width + px;
+      this.pixels[idx] = pc;
       this.pixelTimestamps[idx] = tsSec;
       this.pixelAuthors[idx] = authorIdx;
-      applied.push([x, y, c]);
+      applied.push([px, py, pc]);
     }
 
     if (applied.length > 0) {
       this.totalPixelsPlaced += applied.length;
-      this._appendHistory({ t: now, batch: applied, a: author });
+      if (author) {
+        this.authorCounts.set(author, (this.authorCounts.get(author) || 0) + applied.length);
+      }
+      if (this.isReplayRecordingActive(now)) {
+        if (applied.length === 1) {
+          this._appendHistory({ t: now, x: applied[0][0], y: applied[0][1], c: applied[0][2], a: author || undefined });
+        } else {
+          this._appendHistory({ t: now, batch: applied, a: author || undefined });
+        }
+      }
       this.scheduleSave();
     }
+    return applied;
+  }
+
+  applyBatchPixels(updates, author = 'Admin') {
+    const applied = this._commitPixels(updates, sanitizeNickname(author), Date.now());
     return applied.length;
   }
 
@@ -512,7 +962,6 @@ class PixelWarStore {
       .slice(0, limit)
       .map(([name, count], i) => ({ rank: i + 1, name, count }));
 
-    // Color usage stats
     const colorCounts = new Uint32Array(this.config.palette.length);
     for (let i = 0; i < this.pixels.length; i++) {
       const c = this.pixels[i];
@@ -535,6 +984,7 @@ class PixelWarStore {
     let canvasResized = false;
     let paletteChanged = false;
     let cooldownChanged = false;
+    let lootboxScheduleChanged = false;
 
     if (typeof patch.title === 'string') {
       this.config.title = patch.title.trim().slice(0, 80) || 'Pixel War';
@@ -545,21 +995,20 @@ class PixelWarStore {
     if (typeof patch.announcement === 'string') {
       this.config.announcement = patch.announcement.trim().slice(0, 240);
     }
-    if (typeof patch.paused === 'boolean') {
-      this.config.paused = patch.paused;
+    if (typeof patch.paused === 'boolean') this.config.paused = patch.paused;
+    if (typeof patch.allowSameColor === 'boolean') this.config.allowSameColor = patch.allowSameColor;
+    if (typeof patch.allowPublicExport === 'boolean') this.config.allowPublicExport = patch.allowPublicExport;
+    if (typeof patch.allowTimelapse === 'boolean') this.config.allowTimelapse = patch.allowTimelapse;
+    if (typeof patch.requireNickname === 'boolean') this.config.requireNickname = patch.requireNickname;
+    if (typeof patch.lockNicknameToAuthentik === 'boolean') this.config.lockNicknameToAuthentik = patch.lockNicknameToAuthentik;
+    if (typeof patch.lockBeforeStart === 'boolean') this.config.lockBeforeStart = patch.lockBeforeStart;
+
+    if (patch.startTime === null || patch.startTime === '') {
+      this.config.startTime = null;
+    } else if (typeof patch.startTime === 'string' && !Number.isNaN(Date.parse(patch.startTime))) {
+      this.config.startTime = new Date(patch.startTime).toISOString();
     }
-    if (typeof patch.allowSameColor === 'boolean') {
-      this.config.allowSameColor = patch.allowSameColor;
-    }
-    if (typeof patch.allowPublicExport === 'boolean') {
-      this.config.allowPublicExport = patch.allowPublicExport;
-    }
-    if (typeof patch.allowTimelapse === 'boolean') {
-      this.config.allowTimelapse = patch.allowTimelapse;
-    }
-    if (typeof patch.requireNickname === 'boolean') {
-      this.config.requireNickname = patch.requireNickname;
-    }
+
     if (patch.endTime === null || patch.endTime === '') {
       this.config.endTime = null;
     } else if (typeof patch.endTime === 'string' && !Number.isNaN(Date.parse(patch.endTime))) {
@@ -571,7 +1020,6 @@ class PixelWarStore {
       if (newCd !== this.config.cooldownMs) {
         this.config.cooldownMs = newCd;
         cooldownChanged = true;
-        // Adjust active buckets so reducing cooldown takes effect immediately
         const now = Date.now();
         for (const bucket of this.cooldownBuckets.values()) {
           if (newCd === 0) {
@@ -609,6 +1057,24 @@ class PixelWarStore {
       this._setupAutoSnapshot();
     }
 
+    if (typeof patch.maxAutoSnapshots === 'number' && Number.isFinite(patch.maxAutoSnapshots)) {
+      this.config.maxAutoSnapshots = clampInt(patch.maxAutoSnapshots, 0, 500);
+      this._pruneAutoSnapshots();
+    }
+
+    if (typeof patch.lootboxEnabled === 'boolean' && patch.lootboxEnabled !== this.config.lootboxEnabled) {
+      this.config.lootboxEnabled = patch.lootboxEnabled;
+      lootboxScheduleChanged = true;
+    }
+
+    if (typeof patch.lootboxIntervalMinutes === 'number' && Number.isFinite(patch.lootboxIntervalMinutes)) {
+      const nextInt = clampInt(patch.lootboxIntervalMinutes, 1, 1440);
+      if (nextInt !== this.config.lootboxIntervalMinutes) {
+        this.config.lootboxIntervalMinutes = nextInt;
+        lootboxScheduleChanged = true;
+      }
+    }
+
     if (Array.isArray(patch.palette)) {
       const cleanPalette = patch.palette
         .map((c) => (typeof c === 'string' ? c.trim().toUpperCase() : ''))
@@ -617,7 +1083,6 @@ class PixelWarStore {
       if (cleanPalette.length >= 2) {
         this.config.palette = cleanPalette;
         paletteChanged = true;
-        // Clamp any out-of-range pixel index to 0
         for (let i = 0; i < this.pixels.length; i++) {
           if (this.pixels[i] >= cleanPalette.length) this.pixels[i] = 0;
         }
@@ -634,7 +1099,7 @@ class PixelWarStore {
     }
 
     this.scheduleSave();
-    return { config: this.getPublicConfig(), canvasResized, paletteChanged, cooldownChanged };
+    return { config: this.getPublicConfig(), canvasResized, paletteChanged, cooldownChanged, lootboxScheduleChanged };
   }
 
   resizeCanvas(newW, newH, anchor = 'center', fillColor = 0) {
@@ -670,36 +1135,40 @@ class PixelWarStore {
     this.pixelTimestamps = newTimestamps;
     this.pixelAuthors = newAuthors;
 
-    this._appendHistory({ t: Date.now(), resize: { w: newW, h: newH, anchor, fill } });
+    if (this.isReplayRecordingActive()) {
+      this._appendHistory({ t: Date.now(), resize: { w: newW, h: newH, anchor, fill } });
+    }
     this.scheduleSave();
   }
 
   clearCanvas(fillColor = 0, resetStats = false) {
-    // Auto-backup before destructive clear
     if (this.totalPixelsPlaced > 0) {
       try {
         this.createSnapshot('pre-reset');
       } catch {
-        // ignore backup error
+        // ignore
       }
     }
     const fill = clampInt(fillColor, 0, this.config.palette.length - 1);
     this.pixels.fill(fill);
     this.pixelTimestamps.fill(0);
     this.pixelAuthors.fill(0);
+    this.shields = [];
 
     if (resetStats) {
       this.totalPixelsPlaced = 0;
       this.authorCounts.clear();
       this.authorList = [''];
       this.authorIndexMap = new Map([['', 0]]);
+      this.replayBaselineMeta = null;
       try {
+        if (fs.existsSync(this.baselinePath)) fs.unlinkSync(this.baselinePath);
         fs.writeFileSync(this.historyPath, '');
         this.historyCount = 0;
       } catch {
         // ignore
       }
-    } else {
+    } else if (this.isReplayRecordingActive()) {
       this._appendHistory({ t: Date.now(), clear: fill });
     }
     this.scheduleSave();
@@ -739,10 +1208,9 @@ class PixelWarStore {
     const list = [];
     for (const f of files) {
       try {
-        const meta = JSON.parse(fs.readFileSync(path.join(this.snapshotsDir, f), 'utf8'));
-        list.push(meta);
+        list.push(JSON.parse(fs.readFileSync(path.join(this.snapshotsDir, f), 'utf8')));
       } catch {
-        // skip corrupted
+        // skip
       }
     }
     return list.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
@@ -757,20 +1225,14 @@ class PixelWarStore {
 
   restoreSnapshot(id) {
     const safeId = path.basename(id);
-    if (!/^[a-zA-Z0-9._-]+$/.test(safeId)) {
-      throw new Error('Identifiant de snapshot invalide.');
-    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(safeId)) throw new Error('Identifiant de snapshot invalide.');
     const metaPath = path.join(this.snapshotsDir, `${safeId}.json`);
     const binPath = path.join(this.snapshotsDir, `${safeId}.bin`);
-    if (!fs.existsSync(metaPath) || !fs.existsSync(binPath)) {
-      throw new Error('Snapshot introuvable.');
-    }
+    if (!fs.existsSync(metaPath) || !fs.existsSync(binPath)) throw new Error('Snapshot introuvable.');
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
     const buf = fs.readFileSync(binPath);
     const expected = meta.width * meta.height;
-    if (buf.length !== expected) {
-      throw new Error('Données snapshot corrompues.');
-    }
+    if (buf.length !== expected) throw new Error('Données snapshot corrompues.');
     this.config.width = meta.width;
     this.config.height = meta.height;
     if (Array.isArray(meta.palette) && meta.palette.length >= 2) {
@@ -802,30 +1264,51 @@ class PixelWarStore {
       fs.appendFileSync(this.historyPath, JSON.stringify(entry) + '\n');
       this.historyCount++;
     } catch {
-      // ignore non-fatal log error
+      // ignore
     }
   }
 
   readHistory(maxEvents = 100000) {
-    if (!fs.existsSync(this.historyPath)) return [];
+    const startMs = this.config.startTime ? Date.parse(this.config.startTime) : NaN;
+    let baselineBase64 = null;
+    if (
+      this.replayBaselineMeta &&
+      this.replayBaselineMeta.width === this.config.width &&
+      this.replayBaselineMeta.height === this.config.height &&
+      fs.existsSync(this.baselinePath)
+    ) {
+      try {
+        const b = fs.readFileSync(this.baselinePath);
+        if (b.length === this.config.width * this.config.height) {
+          baselineBase64 = b.toString('base64');
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (!fs.existsSync(this.historyPath)) {
+      return { events: [], baselineBase64, startTime: this.config.startTime };
+    }
     const raw = fs.readFileSync(this.historyPath, 'utf8');
-    if (!raw) return [];
+    if (!raw) return { events: [], baselineBase64, startTime: this.config.startTime };
     const lines = raw.split('\n').filter(Boolean);
     const slice = lines.length > maxEvents ? lines.slice(lines.length - maxEvents) : lines;
     const events = [];
     for (const line of slice) {
       try {
-        events.push(JSON.parse(line));
+        const ev = JSON.parse(line);
+        if (!Number.isNaN(startMs) && typeof ev.t === 'number' && ev.t < startMs) continue;
+        events.push(ev);
       } catch {
-        // skip malformed line
+        // skip
       }
     }
-    return events;
+    return { events, baselineBase64, startTime: this.config.startTime };
   }
 
   banTarget(target) {
     const clean = String(target || '').trim();
-    // Garde-fou MINITEL : ne jamais bannir une IP (tout le trafic passe par le VPS / Sakura)
     if (!clean || /^(\d{1,3}\.){3}\d{1,3}$/.test(clean) || clean === '::1') {
       throw new Error('Le bannissement par IP est désactivé sur l\'infra MINITEL (IP partagée par le VPS). Utilisez un identifiant de session ou un compte Authentik.');
     }
@@ -835,9 +1318,33 @@ class PixelWarStore {
 
   unbanTarget(target) {
     const clean = String(target || '').trim();
-    if (this.bannedSet.delete(clean)) {
+    if (this.bannedSet.delete(clean)) this.scheduleSave();
+  }
+
+  addExtraAdmin(username) {
+    const norm = normalizeUsername(username);
+    if (!norm) throw new Error('Identifiant utilisateur Authentik invalide.');
+    this.extraAdmins.add(norm);
+    this.scheduleSave();
+    return norm;
+  }
+
+  removeExtraAdmin(username) {
+    const norm = normalizeUsername(username);
+    if (norm && this.extraAdmins.delete(norm)) {
       this.scheduleSave();
+      return true;
     }
+    return false;
+  }
+
+  hasExtraAdmin(username) {
+    const norm = normalizeUsername(username);
+    return Boolean(norm && this.extraAdmins.has(norm));
+  }
+
+  listExtraAdmins() {
+    return Array.from(this.extraAdmins).sort();
   }
 
   destroy() {
@@ -848,6 +1355,19 @@ class PixelWarStore {
   }
 }
 
+function normalizeInventory(inv) {
+  const baseItems = {};
+  for (const key of Object.keys(LOOTBOX_ITEMS)) {
+    baseItems[key] = Math.max(0, parseInt(inv?.items?.[key] || 0, 10) || 0);
+  }
+  return {
+    lootboxes: Math.max(0, parseInt(inv?.lootboxes || 0, 10) || 0),
+    items: baseItems,
+    activeBoost: inv?.activeBoost || null,
+    bonusCharges: Math.max(0, parseInt(inv?.bonusCharges || 0, 10) || 0),
+  };
+}
+
 function clampInt(val, min, max) {
   const n = Math.round(Number(val));
   if (!Number.isFinite(n)) return min;
@@ -855,7 +1375,7 @@ function clampInt(val, min, max) {
 }
 
 function validateCooldownMode(mode) {
-  return ['client', 'authentik'].includes(mode) ? mode : 'client';
+  return ['client', 'authentik'].includes(mode) ? mode : 'authentik';
 }
 
 function sanitizeNickname(name) {
@@ -863,4 +1383,9 @@ function sanitizeNickname(name) {
   return name.replace(/[\r\n\t<>]/g, '').trim().slice(0, 24);
 }
 
-module.exports = { PixelWarStore, PALETTE_PRESETS, sanitizeNickname };
+function normalizeUsername(name) {
+  if (typeof name !== 'string') return '';
+  return name.replace(/[\r\n\t<>\s]/g, '').trim().toLowerCase().slice(0, 64);
+}
+
+module.exports = { PixelWarStore, PALETTE_PRESETS, LOOTBOX_ITEMS, sanitizeNickname, normalizeUsername };
