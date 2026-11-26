@@ -1,0 +1,14 @@
+{
+  "name": "pixel-war-promo",
+  "version": "1.0.0",
+  "description": "Pixel War collaborative temps réel, ultra-réglable, optimisée PC & Mobile, prête pour Coolify",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/server.test.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT"
+}

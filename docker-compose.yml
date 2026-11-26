@@ -1,0 +1,49 @@
+# Déploiement Coolify sur Isadora (infra MINITEL)
+# - Aucun port publié sur l'hôte (routage HTTP via Traefik coolify-proxy:80)
+# - Aucun accès docker.sock, aucun privilège, pas de réseau hôte
+# - Plafonds RAM/CPU conformes aux règles §9.1
+services:
+  pixel-war:
+    build: .
+    restart: unless-stopped
+    expose:
+      - "3000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+    environment:
+      PORT: "3000"
+      TRUST_PROXY: "true"
+      DATA_DIR: "/data"
+      EVENT_TITLE: "${EVENT_TITLE:-Pixel War ISMIN}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:?Definir ADMIN_PASSWORD dans Coolify}"
+      SESSION_SECRET: "${SESSION_SECRET:?Definir SESSION_SECRET dans Coolify}"
+      CANVAS_WIDTH: "${CANVAS_WIDTH:-128}"
+      CANVAS_HEIGHT: "${CANVAS_HEIGHT:-128}"
+      COOLDOWN_MS: "${COOLDOWN_MS:-5000}"
+      MAX_CHARGES: "${MAX_CHARGES:-1}"
+      # 'client' (public, sans limite IP) ou 'authentik' (si forward_auth activé sur Caddy)
+      COOLDOWN_MODE: "${COOLDOWN_MODE:-client}"
+      # Activer UNIQUEMENT si la route passe par Authentik forward_auth sur Sakura/Caddy
+      TRUST_AUTHENTIK_HEADERS: "${TRUST_AUTHENTIK_HEADERS:-false}"
+      AUTHENTIK_ADMIN_GROUPS: "${AUTHENTIK_ADMIN_GROUPS:-admins-infra,MINITEL}"
+      AUTO_SNAPSHOT_MINUTES: "${AUTO_SNAPSHOT_MINUTES:-15}"
+    volumes:
+      - pixel_war_data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  pixel_war_data:
