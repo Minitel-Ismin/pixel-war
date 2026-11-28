@@ -135,6 +135,14 @@
           <button id="btnOpenLootbox" class="btn btn-primary" disabled>Ouvrir !</button>
         </div>
         <div id="lootRevealBox" class="loot-reveal hidden"></div>
+        <!-- Admin-only infinite boosts banner (strictly hidden for normal players) -->
+        <div id="adminBoostBar" class="admin-boost-bar hidden">
+          <div>
+            <strong>👑 Mode Admin — Boosts infinis</strong>
+            <div class="muted small">Réservé aux administrateurs : activez n'importe quel boost à l'infini ou remplissez votre stock.</div>
+          </div>
+          <button id="btnAdminGiveAll" class="btn btn-primary btn-sm">👑 +99 Tous les boosts</button>
+        </div>
         <h3>Mes boosts disponibles</h3>
         <div id="inventoryList" class="inventory-grid"></div>
       </div>
@@ -434,7 +442,8 @@
             </div>
 
             <div class="card-section">
-              <h3>🖼️ Importer une image sur le canvas</h3>
+              <h3>🖼️ Importer une image & 🤖 Bot de dessin automatique</h3>
+              <p class="muted small">Convertit l'image dans la palette active : posez-la d'un coup ou laissez un bot la compléter pixel par pixel (avec option de défense automatique).</p>
               <div class="grid-3">
                 <label class="field"><span>Fichier image</span><input id="admImportFile" type="file" accept="image/*" /></label>
                 <label class="field">
@@ -446,7 +455,39 @@
                 </label>
                 <label class="field"><span>Largeur cible (px)</span><input id="admImportW" type="number" value="48" min="4" max="500" /></label>
               </div>
-              <button id="btnAdmImportImg" class="btn btn-primary">Dessiner l'image sur le canvas</button>
+              <div class="grid-3">
+                <label class="field">
+                  <span>Vitesse bot (pixels/sec)</span>
+                  <input id="admBotRate" type="number" value="5" min="0.2" max="200" step="0.5" />
+                </label>
+                <label class="field">
+                  <span>Ordre de remplissage</span>
+                  <select id="admBotOrder">
+                    <option value="random">Aléatoire (organique)</option>
+                    <option value="row">Ligne par ligne</option>
+                    <option value="radial">Du centre vers l'extérieur</option>
+                    <option value="col">Colonne par colonne</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>Nom / Auteur du bot</span>
+                  <input id="admBotAuthor" type="text" value="PixelBot" maxlength="24" />
+                </label>
+              </div>
+              <div class="preset-chips">
+                <button type="button" class="chip" data-bot-rate="1">1 px/s (Lent)</button>
+                <button type="button" class="chip" data-bot-rate="5">5 px/s (Normal)</button>
+                <button type="button" class="chip" data-bot-rate="15">15 px/s (Rapide)</button>
+                <button type="button" class="chip" data-bot-rate="50">50 px/s (Turbo)</button>
+              </div>
+              <label class="toggle"><input id="admBotMaintain" type="checkbox" /><span>🛡️ Mode Défense : réparer automatiquement si des joueurs recouvrent l'image</span></label>
+              <div class="btn-row">
+                <button id="btnAdmStartBot" class="btn btn-primary">🤖 Lancer le Bot sur cette image</button>
+                <button id="btnAdmImportImg" class="btn btn-secondary">⚡ Dessiner instantanément</button>
+                <button id="btnAdmStopAllBots" class="btn btn-danger btn-sm">🛑 Tout arrêter</button>
+              </div>
+              <h4>Bots actifs</h4>
+              <div id="botJobsList" class="snapshots-list"></div>
             </div>
           </div>
 
@@ -477,6 +518,14 @@
                 <input id="admLootTargetInput" type="text" placeholder="Identifiant Authentik (ex: camille)" />
                 <button id="btnAdmDropTarget" class="btn btn-primary">🎁 Envoyer</button>
               </div>
+            </div>
+            <div class="card-section">
+              <h3>👑 Give infini de boosts (Admin uniquement)</h3>
+              <p class="muted small">Donnez-vous instantanément tous les boosts (ou un boost précis) en illimité. Inaccessible aux participants normaux.</p>
+              <div class="btn-row">
+                <button id="btnAdmGiveAllBoosts" class="btn btn-primary">👑 +99 Tous les boosts & Lootboxes</button>
+              </div>
+              <div id="admQuickGiveRow" class="preset-chips"></div>
             </div>
           </div>
 

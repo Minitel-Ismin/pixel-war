@@ -458,6 +458,117 @@ test('StartTime replay baseline, wide brush, lootboxes & boosts (frenzy, bomb, b
   const invAfterCharges = app.store.getInventory(p1Key);
   assert.equal(invAfterCharges.bonusCharges, 5);
 
+  // 5. Security: non-admin MUST get 403 on ALL bot & infinite boost admin routes!
+  for (const [method, url, body] of [
+    ['GET', '/api/admin/bot', null],
+    ['POST', '/api/admin/bot/start', { name: 'hack', pixels: [{ x: 1, y: 1, c: 2 }], ratePerSec: 10 }],
+    ['POST', '/api/admin/bot/control', { action: 'stop_all' }],
+    ['POST', '/api/admin/boosts/give', { itemId: 'all', amount: 99 }],
+    ['POST', '/api/admin/boosts/activate', { itemId: 'bomb' }],
+  ]) {
+    const r = await fetch(`${baseUrl}${url}`, {
+      method,
+      headers: { ...p1Headers, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    assert.equal(r.status, 403, `Non-admin ${method} ${url} must return 403`);
+  }
+
+  // Non-admin still cannot activate a boost they don't own via user route
+  const p2NoItem = await fetch(`${baseUrl}/api/lootbox/activate`, {
+    method: 'POST',
+    headers: { ...p2Headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemId: 'bomb' }),
+  });
+  assert.equal(p2NoItem.status, 400);
+
+  // 6. Admin infinite boosts: activate even at 0 stock + give all (+99)
+  const admAct1 = await fetch(`${baseUrl}/api/admin/boosts/activate`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemId: 'bomb' }),
+  });
+  assert.equal(admAct1.status, 200);
+  // Admin fires bomb even with adminBypass=true
+  wsAdmin.sendJSON({ type: 'place', x: 100, y: 100, color: 12, adminBypass: true });
+  await wsAdmin.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=100&y=100`, { headers: adminHeaders })).json()).color, 12);
+  assert.equal((await (await fetch(`${baseUrl}/api/pixel?x=101&y=100`, { headers: adminHeaders })).json()).color, 12);
+
+  // Admin can immediately activate bomb AGAIN infinitely without owning stock
+  const admAct2 = await fetch(`${baseUrl}/api/admin/boosts/activate`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemId: 'bomb' }),
+  });
+  assert.equal(admAct2.status, 200);
+
+  // Admin gives +99 of all boosts
+  const giveAllRes = await fetch(`${baseUrl}/api/admin/boosts/give`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ itemId: 'all', amount: 99 }),
+  });
+  assert.equal(giveAllRes.status, 200);
+  const giveAllData = await giveAllRes.json();
+  assert.ok(giveAllData.inventory.items.frenzy >= 99);
+  assert.ok(giveAllData.inventory.items.bomb >= 99);
+  assert.ok(giveAllData.inventory.items.shield >= 99);
+  assert.ok(giveAllData.inventory.lootboxes >= 99);
+
+  // 7. Admin Image Auto-Fill Bot (with auto-defense repair + stop)
+  const botPixels = [
+    { x: 2, y: 2, c: 15 },
+    { x: 3, y: 2, c: 15 },
+    { x: 4, y: 2, c: 15 },
+    { x: 2, y: 3, c: 16 },
+    { x: 3, y: 3, c: 16 },
+    { x: 4, y: 3, c: 16 },
+  ];
+  const startBotRes = await fetch(`${baseUrl}/api/admin/bot/start`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: 'LogoTest.png',
+      pixels: botPixels,
+      ratePerSec: 100,
+      order: 'row',
+      maintain: true,
+      author: 'PixelBot',
+    }),
+  });
+  assert.equal(startBotRes.status, 200);
+  const { job } = await startBotRes.json();
+  assert.equal(job.totalPixels, 6);
+
+  // Wait briefly for bot ticks to complete all 6 pixels
+  await new Promise((r) => setTimeout(r, 260));
+  for (const p of botPixels) {
+    const info = await (await fetch(`${baseUrl}/api/pixel?x=${p.x}&y=${p.y}`, { headers: adminHeaders })).json();
+    assert.equal(info.color, p.c, `Bot must paint pixel (${p.x},${p.y})`);
+    assert.equal(info.author, 'PixelBot');
+  }
+
+  const botListRes = await fetch(`${baseUrl}/api/admin/bot`, { headers: adminHeaders });
+  const botList = await botListRes.json();
+  assert.equal(botList.jobs[0].status, 'defending');
+
+  // Player 2 overwrites (2, 2) -> defending bot automatically repairs it back to color 15!
+  wsP2.sendJSON({ type: 'place', x: 2, y: 2, color: 3 });
+  await wsP2.nextMessage((m) => m.type === 'text' && m.data.type === 'place_ok');
+  await new Promise((r) => setTimeout(r, 260));
+  const repaired = await (await fetch(`${baseUrl}/api/pixel?x=2&y=2`, { headers: adminHeaders })).json();
+  assert.equal(repaired.color, 15, 'Defending bot must auto-repair overwritten pixel');
+
+  // Stop bot cleanly
+  const stopRes = await fetch(`${baseUrl}/api/admin/bot/control`, {
+    method: 'POST',
+    headers: { ...adminHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: job.id, action: 'stop' }),
+  });
+  assert.equal(stopRes.status, 200);
+  assert.equal((await stopRes.json()).jobs.length, 0);
+
   wsAdmin.close();
   wsP1.close();
   wsP2.close();

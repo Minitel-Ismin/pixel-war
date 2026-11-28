@@ -484,9 +484,67 @@ class PixelWarStore {
       inv = normalizeInventory(null);
       this.inventories.set(userKey, inv);
     }
-    inv.lootboxes += Math.max(1, Math.min(10, count | 0));
+    inv.lootboxes = Math.min(9999, inv.lootboxes + Math.max(1, Math.min(999, count | 0)));
     this.scheduleSave();
     return this.getInventory(userKey);
+  }
+
+  // Admin-only: se giver un ou tous les boosts à volonté (jusqu'à 9999, renouvelable à l'infini)
+  grantAdminBoosts(userKey, { itemId = 'all', amount = 99 } = {}) {
+    let inv = this.inventories.get(userKey);
+    if (!inv) {
+      inv = normalizeInventory(null);
+      this.inventories.set(userKey, inv);
+    }
+    const qty = clampInt(amount, 1, 999);
+    if (itemId === 'all') {
+      for (const key of Object.keys(LOOTBOX_ITEMS)) {
+        inv.items[key] = Math.min(9999, (inv.items[key] || 0) + qty);
+      }
+      inv.lootboxes = Math.min(9999, (inv.lootboxes || 0) + Math.min(qty, 99));
+    } else if (itemId === 'lootbox') {
+      inv.lootboxes = Math.min(9999, (inv.lootboxes || 0) + qty);
+    } else if (LOOTBOX_ITEMS[itemId]) {
+      inv.items[itemId] = Math.min(9999, (inv.items[itemId] || 0) + qty);
+    } else {
+      throw new Error('Objet inconnu.');
+    }
+    this.scheduleSave();
+    return this.getInventory(userKey);
+  }
+
+  // Admin-only: activer instantanément n'importe quel boost sans consommer de stock (infini)
+  activateBoostAdmin(userKey, itemId) {
+    const def = LOOTBOX_ITEMS[itemId];
+    if (!def) throw new Error('Objet inconnu.');
+    let inv = this.inventories.get(userKey);
+    if (!inv) {
+      inv = normalizeInventory(null);
+      this.inventories.set(userKey, inv);
+    }
+    const now = Date.now();
+    this._cleanupActiveBoost(inv, now);
+
+    if (itemId === 'charges5') {
+      inv.bonusCharges = Math.min(999, (inv.bonusCharges || 0) + def.charges);
+      this.scheduleSave();
+      return { item: def, inventory: this.getInventory(userKey) };
+    }
+
+    if (itemId === 'frenzy') {
+      inv.activeBoost = { type: 'frenzy', expiresAt: now + def.durationMs };
+    } else if (itemId === 'rainbow') {
+      inv.activeBoost = { type: 'rainbow', expiresAt: now + def.durationMs, lastPlaceAt: 0, rainbowStep: 0 };
+    } else if (itemId === 'bomb') {
+      inv.activeBoost = { type: 'bomb', remainingUses: 1 };
+    } else if (itemId === 'brush3') {
+      inv.activeBoost = { type: 'brush3', remainingUses: def.uses };
+    } else if (itemId === 'shield') {
+      inv.activeBoost = { type: 'shield', remainingUses: 1 };
+    }
+
+    this.scheduleSave();
+    return { item: def, inventory: this.getInventory(userKey) };
   }
 
   openLootbox(userKey) {
@@ -711,7 +769,7 @@ class PixelWarStore {
 
     let inv = this.inventories.get(userKey);
     if (inv) this._cleanupActiveBoost(inv, now);
-    const activeBoost = !isAdminBypass && inv ? inv.activeBoost : null;
+    const activeBoost = inv ? inv.activeBoost : null;
 
     // Anti-flood per session (generous limit so Frenzy + Drag Paint works super smoothly!)
     if (!isAdminBypass) {

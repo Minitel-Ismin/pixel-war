@@ -270,6 +270,121 @@ function createServer(options = {}) {
     });
   }
 
+  // ─── Admin Image Auto-Fill Bot Engine (STRICTLY ADMIN-ONLY) ───
+  const botJobs = new Map(); // id -> job
+
+  function orderBotPixels(rawPixels, order, width, height) {
+    const valid = [];
+    const seen = new Set();
+    for (const p of rawPixels) {
+      const x = p.x | 0;
+      const y = p.y | 0;
+      const c = p.c | 0;
+      if (x < 0 || x >= width || y < 0 || y >= height) continue;
+      if (c < 0 || c >= store.config.palette.length) continue;
+      const k = y * width + x;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      valid.push([x, y, c]);
+    }
+    if (order === 'random') {
+      for (let i = valid.length - 1; i > 0; i--) {
+        const j = crypto.randomInt(0, i + 1);
+        const tmp = valid[i];
+        valid[i] = valid[j];
+        valid[j] = tmp;
+      }
+    } else if (order === 'radial') {
+      if (valid.length > 0) {
+        let sx = 0, sy = 0;
+        for (const [x, y] of valid) { sx += x; sy += y; }
+        const cx = sx / valid.length;
+        const cy = sy / valid.length;
+        valid.sort((a, b) => Math.hypot(a[0] - cx, a[1] - cy) - Math.hypot(b[0] - cx, b[1] - cy));
+      }
+    } else if (order === 'col') {
+      valid.sort((a, b) => (a[0] - b[0]) || (a[1] - b[1]));
+    } else {
+      // 'row' (default top-to-bottom)
+      valid.sort((a, b) => (a[1] - b[1]) || (a[0] - b[0]));
+    }
+    return valid;
+  }
+
+  function serializeBotJob(job) {
+    const w = store.config.width;
+    const h = store.config.height;
+    let matched = 0;
+    for (const [x, y, c] of job.pixels) {
+      if (x >= 0 && x < w && y >= 0 && y < h && store.pixels[y * w + x] === c) {
+        matched++;
+      }
+    }
+    const total = job.pixels.length;
+    const done = matched >= total;
+    return {
+      id: job.id,
+      name: job.name,
+      author: job.author,
+      order: job.order,
+      ratePerSec: job.ratePerSec,
+      maintain: job.maintain,
+      paused: job.paused,
+      totalPixels: total,
+      completedPixels: matched,
+      percent: total > 0 ? Math.round((matched / total) * 100) : 100,
+      placedByBot: job.placedByBot,
+      status: job.paused ? 'paused' : (done ? (job.maintain ? 'defending' : 'completed') : 'running'),
+      createdAt: job.createdAt,
+    };
+  }
+
+  const botTicker = setInterval(() => {
+    if (botJobs.size === 0) return;
+    const w = store.config.width;
+    const h = store.config.height;
+
+    for (const [id, job] of botJobs.entries()) {
+      if (job.paused) continue;
+      job.carry += job.ratePerSec * 0.1;
+      const budget = Math.floor(job.carry);
+      if (budget <= 0) continue;
+      job.carry -= budget;
+
+      const batch = [];
+      const len = job.pixels.length;
+      if (len === 0) {
+        botJobs.delete(id);
+        continue;
+      }
+
+      let checked = 0;
+      while (batch.length < budget && checked < len) {
+        const idx = job.cursor % len;
+        job.cursor = (job.cursor + 1) % len;
+        checked++;
+        const [x, y, c] = job.pixels[idx];
+        if (x < 0 || x >= w || y < 0 || y >= h) continue;
+        if (c < 0 || c >= store.config.palette.length) continue;
+        if (store.pixels[y * w + x] !== c) {
+          batch.push({ x, y, c });
+        }
+      }
+
+      if (batch.length > 0) {
+        store.applyBatchPixels(batch, job.author);
+        job.placedByBot += batch.length;
+        for (const p of batch) {
+          wss.broadcastBinary(encodePixelBinary(p.x, p.y, p.c));
+        }
+      } else if (!job.maintain) {
+        // Every pixel matches target and defend mode is off -> job finished!
+        botJobs.delete(id);
+      }
+    }
+  }, 100);
+  botTicker.unref();
+
   // ─── Random Hourly Lootbox Drop Scheduler ───
   let lootboxTimer = null;
   let nextLootboxDropAt = null;
@@ -620,6 +735,118 @@ function createServer(options = {}) {
             return sendJSON(res, 400, { error: 'Aucun joueur connecté pour recevoir une lootbox.' });
           }
           return sendJSON(res, 200, { ok: true, winner: winner.username });
+        }
+
+        // Admin-only: se giver un ou tous les boosts à l'infini (strictement interdit aux joueurs normaux)
+        if (pathname === '/api/admin/boosts/give' && method === 'POST') {
+          const body = await readJsonBody(req, 8192);
+          const clientId = ensureClientId(req, res);
+          const selfKey = store.getUserKey(clientId, ak?.uid || '');
+          let targetKey = selfKey;
+          if (typeof body.targetUsername === 'string' && body.targetUsername.trim()) {
+            const targetNorm = normalizeUsername(body.targetUsername);
+            let foundKey = null;
+            for (const c of wss.clients) {
+              if (c.meta && normalizeUsername(c.meta.authentikUsername || c.meta.nickname || '') === targetNorm) {
+                foundKey = c.meta.userKey;
+                break;
+              }
+            }
+            targetKey = foundKey || `ak:${targetNorm}`;
+          }
+          try {
+            const inventory = store.grantAdminBoosts(targetKey, {
+              itemId: String(body.itemId || 'all'),
+              amount: Number(body.amount ?? 99),
+            });
+            pushInventoryToUser(targetKey);
+            return sendJSON(res, 200, { ok: true, inventory });
+          } catch (err) {
+            return sendJSON(res, 400, { error: err.message });
+          }
+        }
+
+        // Admin-only: activer n'importe quel boost instantanément sans consommer de stock (infini)
+        if (pathname === '/api/admin/boosts/activate' && method === 'POST') {
+          const body = await readJsonBody(req, 8192);
+          const clientId = ensureClientId(req, res);
+          const userKey = store.getUserKey(clientId, ak?.uid || '');
+          try {
+            const result = store.activateBoostAdmin(userKey, String(body.itemId || ''));
+            pushInventoryToUser(userKey);
+            return sendJSON(res, 200, {
+              ok: true,
+              ...result,
+              cooldown: store.getCooldownStatus(clientId, ak?.uid || '', false),
+            });
+          } catch (err) {
+            return sendJSON(res, 400, { error: err.message });
+          }
+        }
+
+        // Admin-only: Bot de remplissage automatique d'image
+        if (pathname === '/api/admin/bot' && method === 'GET') {
+          return sendJSON(res, 200, {
+            jobs: Array.from(botJobs.values()).map(serializeBotJob),
+          });
+        }
+
+        if (pathname === '/api/admin/bot/start' && method === 'POST') {
+          const body = await readJsonBody(req, 8 * 1024 * 1024);
+          if (!Array.isArray(body.pixels) || body.pixels.length === 0) {
+            return sendJSON(res, 400, { error: 'Aucun pixel valide dans l\'image.' });
+          }
+          if (botJobs.size >= 5) {
+            return sendJSON(res, 400, { error: 'Maximum 5 bots simultanés. Arrêtez un bot avant d\'en lancer un autre.' });
+          }
+          const order = ['random', 'row', 'radial', 'col'].includes(body.order) ? body.order : 'random';
+          const ordered = orderBotPixels(body.pixels, order, store.config.width, store.config.height);
+          if (ordered.length === 0) {
+            return sendJSON(res, 400, { error: 'Tous les pixels de l\'image sont hors du canvas.' });
+          }
+          const rateRaw = Number(body.ratePerSec);
+          const ratePerSec = Number.isFinite(rateRaw) ? Math.max(0.2, Math.min(200, rateRaw)) : 5;
+          const id = crypto.randomBytes(4).toString('hex');
+          const job = {
+            id,
+            name: String(body.name || 'Image Bot').trim().slice(0, 48) || 'Image Bot',
+            author: sanitizeNickname(body.author || 'PixelBot') || 'PixelBot',
+            pixels: ordered,
+            order,
+            ratePerSec,
+            maintain: Boolean(body.maintain),
+            paused: false,
+            cursor: 0,
+            carry: 1, // place first pixel promptly
+            placedByBot: 0,
+            createdAt: new Date().toISOString(),
+          };
+          botJobs.set(id, job);
+          return sendJSON(res, 200, { ok: true, job: serializeBotJob(job) });
+        }
+
+        if (pathname === '/api/admin/bot/control' && method === 'POST') {
+          const body = await readJsonBody(req, 16_384);
+          const id = String(body.id || '');
+          if (body.action === 'stop_all') {
+            botJobs.clear();
+            return sendJSON(res, 200, { ok: true, jobs: [] });
+          }
+          const job = botJobs.get(id);
+          if (!job) return sendJSON(res, 404, { error: 'Bot introuvable.' });
+
+          if (body.action === 'stop') {
+            botJobs.delete(id);
+            return sendJSON(res, 200, { ok: true, jobs: Array.from(botJobs.values()).map(serializeBotJob) });
+          }
+          if (body.action === 'pause') job.paused = true;
+          else if (body.action === 'resume') job.paused = false;
+          else if (body.action === 'toggle_maintain') job.maintain = !job.maintain;
+          else if (body.action === 'set_rate') {
+            const r = Number(body.ratePerSec);
+            if (Number.isFinite(r)) job.ratePerSec = Math.max(0.2, Math.min(200, r));
+          }
+          return sendJSON(res, 200, { ok: true, job: serializeBotJob(job), jobs: Array.from(botJobs.values()).map(serializeBotJob) });
         }
 
         if (pathname === '/api/admin/clear' && method === 'POST') {
@@ -1042,8 +1269,10 @@ function createServer(options = {}) {
     },
     stop() {
       clearInterval(stateWatcher);
+      clearInterval(botTicker);
       if (lootboxTimer) clearInterval(lootboxTimer);
       if (onlineBroadcastTimer) clearTimeout(onlineBroadcastTimer);
+      botJobs.clear();
       wss.close();
       store.destroy();
       return new Promise((resolve) => server.close(resolve));

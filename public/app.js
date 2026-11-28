@@ -1190,34 +1190,41 @@
       dropInfo.textContent = `🎁 1 lootbox aléatoire toutes les ${state.config.lootboxIntervalMinutes} min.`;
     }
 
+    const adminBoostBar = document.getElementById('adminBoostBar');
+    if (adminBoostBar) adminBoostBar.classList.toggle('hidden', !state.isAdmin);
+
     const listEl = document.getElementById('inventoryList');
     listEl.innerHTML = '';
     for (const def of Object.values(state.lootboxItems)) {
       const qty = inv.items?.[def.id] || 0;
       const card = document.createElement('div');
-      card.className = 'inv-card' + (qty > 0 ? ' owned' : '');
+      card.className = 'inv-card' + (qty > 0 || state.isAdmin ? ' owned' : '');
+      const actionsHtml = state.isAdmin
+        ? `<div class="btn-row">
+            <button class="btn btn-primary btn-sm" data-admin-act>⚡ Activer (∞)</button>
+            <button class="btn btn-secondary btn-sm" data-admin-give>+99</button>
+          </div>`
+        : `<button class="btn ${qty > 0 ? 'btn-primary' : 'btn-secondary'} btn-sm" data-user-act ${qty <= 0 ? 'disabled' : ''}>
+            ${qty > 0 ? 'Activer' : def.rarity}
+          </button>`;
       card.innerHTML = `
         <div class="inv-head">
           <span class="inv-title">${def.icon} ${escapeHtml(def.name)}</span>
           <span class="pill ${qty > 0 ? 'pill-green' : ''}">×${qty}</span>
         </div>
         <div class="muted small">${escapeHtml(def.description)}</div>
-        <button class="btn ${qty > 0 ? 'btn-primary' : 'btn-secondary'} btn-sm" ${qty <= 0 ? 'disabled' : ''}>
-          ${qty > 0 ? 'Activer' : def.rarity}
-        </button>
+        ${actionsHtml}
       `;
-      if (qty > 0) {
-        card.querySelector('button').addEventListener('click', async () => {
+      const userBtn = card.querySelector('[data-user-act]');
+      if (userBtn && qty > 0) {
+        userBtn.addEventListener('click', async () => {
           const r = await fetch('/api/lootbox/activate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ itemId: def.id }),
           });
           const d = await r.json();
-          if (!r.ok) {
-            showToast(d.error || 'Activation impossible', 'error');
-            return;
-          }
+          if (!r.ok) { showToast(d.error || 'Activation impossible', 'error'); return; }
           syncInventory(d.inventory);
           syncCooldownFromServer(d.cooldown);
           closeModal('modalLootbox');
@@ -1226,6 +1233,26 @@
             showToast('💡 Astuce : active 🖌️ pour peindre en glissant pendant la Frénésie !', 'info');
           }
         });
+      }
+      const admActBtn = card.querySelector('[data-admin-act]');
+      if (admActBtn && state.isAdmin) {
+        admActBtn.addEventListener('click', async () => {
+          const r = await fetch('/api/admin/boosts/activate', {
+            method: 'POST',
+            headers: adminHeaders(),
+            body: JSON.stringify({ itemId: def.id }),
+          });
+          const d = await r.json();
+          if (!r.ok) { showToast(d.error || 'Activation impossible', 'error'); return; }
+          syncInventory(d.inventory);
+          syncCooldownFromServer(d.cooldown);
+          closeModal('modalLootbox');
+          showToast(`👑 ${def.icon} ${def.name} activé (Admin ∞) !`, 'success');
+        });
+      }
+      const admGiveBtn = card.querySelector('[data-admin-give]');
+      if (admGiveBtn && state.isAdmin) {
+        admGiveBtn.addEventListener('click', () => adminGiveBoost(def.id, 99));
       }
       listEl.appendChild(card);
     }
@@ -1790,15 +1817,117 @@
     }
   }
 
+  let botPollTimer = null;
+
+  async function adminGiveBoost(itemId = 'all', amount = 99) {
+    const res = await fetch('/api/admin/boosts/give', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ itemId, amount }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(d.error || 'Give refusé', 'error');
+      return;
+    }
+    syncInventory(d.inventory);
+    showToast(itemId === 'all' ? '👑 +99 de tous les boosts ajoutés !' : `👑 +${amount} ${itemId} ajoutés !`, 'success');
+  }
+
+  function renderAdminQuickGiveRow() {
+    const row = document.getElementById('admQuickGiveRow');
+    if (!row) return;
+    row.innerHTML = '';
+    for (const def of Object.values(state.lootboxItems)) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chip';
+      btn.textContent = `+99 ${def.icon} ${def.name}`;
+      btn.addEventListener('click', () => adminGiveBoost(def.id, 99));
+      row.appendChild(btn);
+    }
+  }
+
+  async function refreshBotJobs() {
+    if (!state.isAdmin) return;
+    const res = await fetch('/api/admin/bot', { headers: adminHeaders() });
+    if (!res.ok) return;
+    const data = await res.json();
+    const list = document.getElementById('botJobsList');
+    if (!list) return;
+    if (!data.jobs || data.jobs.length === 0) {
+      list.innerHTML = '<div class="muted small">Aucun bot actif en ce moment.</div>';
+      return;
+    }
+    list.innerHTML = '';
+    for (const job of data.jobs) {
+      const row = document.createElement('div');
+      row.className = 'list-row';
+      const statusBadge = job.status === 'paused'
+        ? '<span class="pill pill-amber">⏸ Pause</span>'
+        : job.status === 'defending'
+          ? '<span class="pill pill-green">🛡️ Défense</span>'
+          : '<span class="pill pill-blue">🤖 En cours</span>';
+      row.innerHTML = `
+        <div style="flex:1;min-width:0">
+          <div><strong>${escapeHtml(job.name)}</strong> ${statusBadge} <span class="muted small">${job.ratePerSec} px/s</span></div>
+          <div class="muted small">${job.completedPixels} / ${job.totalPixels} px (${job.percent}%) • Par ${escapeHtml(job.author)}</div>
+          <div class="bot-progress"><span style="width:${job.percent}%"></span></div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-secondary btn-sm" data-bot-toggle>${job.paused ? '▶' : '⏸'}</button>
+          <button class="btn ${job.maintain ? 'btn-primary' : 'btn-secondary'} btn-sm" data-bot-def title="Mode Défense">🛡️</button>
+          <button class="btn btn-danger btn-sm" data-bot-stop>🛑</button>
+        </div>
+      `;
+      row.querySelector('[data-bot-toggle]').addEventListener('click', async () => {
+        await fetch('/api/admin/bot/control', {
+          method: 'POST',
+          headers: adminHeaders(),
+          body: JSON.stringify({ id: job.id, action: job.paused ? 'resume' : 'pause' }),
+        });
+        refreshBotJobs();
+      });
+      row.querySelector('[data-bot-def]').addEventListener('click', async () => {
+        await fetch('/api/admin/bot/control', {
+          method: 'POST',
+          headers: adminHeaders(),
+          body: JSON.stringify({ id: job.id, action: 'toggle_maintain' }),
+        });
+        refreshBotJobs();
+      });
+      row.querySelector('[data-bot-stop]').addEventListener('click', async () => {
+        await fetch('/api/admin/bot/control', {
+          method: 'POST',
+          headers: adminHeaders(),
+          body: JSON.stringify({ id: job.id, action: 'stop' }),
+        });
+        refreshBotJobs();
+      });
+      list.appendChild(row);
+    }
+  }
+
   function showAdminView() {
     document.getElementById('adminLoginView').classList.toggle('hidden', state.isAdmin || !state.passwordLoginEnabled);
     document.getElementById('adminPanelView').classList.toggle('hidden', !state.isAdmin);
     document.getElementById('btnAdmLogout').classList.toggle('hidden', !state.passwordLoginEnabled);
+    if (botPollTimer) { clearInterval(botPollTimer); botPollTimer = null; }
     if (state.isAdmin) {
       populateAdminForm();
+      renderAdminQuickGiveRow();
       refreshSnapshotsList();
+      refreshBotJobs();
       refreshAdminsList();
       refreshBansList();
+      botPollTimer = setInterval(() => {
+        if (!document.getElementById('modalAdmin').classList.contains('hidden')) {
+          refreshBotJobs();
+        } else {
+          clearInterval(botPollTimer);
+          botPollTimer = null;
+        }
+      }, 1500);
     }
   }
 
@@ -1986,9 +2115,18 @@
     document.getElementById('admLootTargetInput').value = '';
   });
 
-  document.getElementById('btnAdmImportImg').addEventListener('click', async () => {
+  document.querySelectorAll('[data-bot-rate]').forEach((chip) => {
+    chip.addEventListener('click', () => {
+      document.getElementById('admBotRate').value = chip.getAttribute('data-bot-rate');
+    });
+  });
+
+  document.getElementById('btnAdminGiveAll')?.addEventListener('click', () => adminGiveBoost('all', 99));
+  document.getElementById('btnAdmGiveAllBoosts')?.addEventListener('click', () => adminGiveBoost('all', 99));
+
+  async function quantizeSelectedAdminImage() {
     const file = document.getElementById('admImportFile').files?.[0];
-    if (!file) { showToast('Sélectionnez une image d\'abord.', 'error'); return; }
+    if (!file) { showToast('Sélectionnez une image d\'abord.', 'error'); return null; }
     const startX = parseInt(document.getElementById('admImportX').value, 10) || 0;
     const startY = parseInt(document.getElementById('admImportY').value, 10) || 0;
     const targetW = Math.max(4, Math.min(500, parseInt(document.getElementById('admImportW').value, 10) || 48));
@@ -2021,13 +2159,58 @@
         pixels.push({ x: startX + x, y: startY + y, c: bestIdx });
       }
     }
+    return { name: file.name, pixels };
+  }
+
+  document.getElementById('btnAdmImportImg').addEventListener('click', async () => {
+    const data = await quantizeSelectedAdminImage();
+    if (!data) return;
     const res = await fetch('/api/admin/import', {
       method: 'POST',
       headers: adminHeaders(),
-      body: JSON.stringify({ pixels, author: state.nickname || 'Admin' }),
+      body: JSON.stringify({ pixels: data.pixels, author: state.nickname || 'Admin' }),
     });
     if (res.ok) showToast(`Image importée (${(await res.json()).applied} pixels) !`, 'success');
     else showToast('Erreur import.', 'error');
+  });
+
+  document.getElementById('btnAdmStartBot').addEventListener('click', async () => {
+    const data = await quantizeSelectedAdminImage();
+    if (!data) return;
+    const ratePerSec = parseFloat(document.getElementById('admBotRate').value) || 5;
+    const order = document.getElementById('admBotOrder').value || 'random';
+    const maintain = document.getElementById('admBotMaintain').checked;
+    const author = document.getElementById('admBotAuthor').value.trim() || 'PixelBot';
+
+    const res = await fetch('/api/admin/bot/start', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({
+        name: data.name,
+        pixels: data.pixels,
+        ratePerSec,
+        order,
+        maintain,
+        author,
+      }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showToast(d.error || 'Impossible de lancer le bot', 'error');
+      return;
+    }
+    showToast(`🤖 Bot "${d.job.name}" lancé (${d.job.totalPixels} px à ${d.job.ratePerSec} px/s) !`, 'success');
+    refreshBotJobs();
+  });
+
+  document.getElementById('btnAdmStopAllBots').addEventListener('click', async () => {
+    await fetch('/api/admin/bot/control', {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ action: 'stop_all' }),
+    });
+    showToast('🛑 Tous les bots ont été arrêtés.');
+    refreshBotJobs();
   });
 
   document.getElementById('btnAdmAddAdmin').addEventListener('click', async () => {
